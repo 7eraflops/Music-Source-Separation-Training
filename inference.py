@@ -20,6 +20,7 @@ from utils.audio_utils import normalize_audio, denormalize_audio, draw_spectrogr
 from utils.settings import get_model_from_config, parse_args_inference
 from utils.model_utils import demix
 from utils.model_utils import prefer_target_instrument, apply_tta, load_start_checkpoint
+from utils.latent_saver import setup_latent_saver
 
 import warnings
 
@@ -85,7 +86,10 @@ def run_folder(model, args, config, device, verbose: bool = False):
             if config.inference['normalize'] is True:
                 mix, norm_params = normalize_audio(mix)
 
+        latent_saver = setup_latent_saver(model, args, config, path)
         waveforms_orig = demix(config, model, mix, device, model_type=args.model_type, pbar=detailed_pbar)
+        if latent_saver:
+            latent_saver.save_and_remove_hooks()
 
         if args.use_tta:
             waveforms_orig = apply_tta(config, model, mix, waveforms_orig, device, args.model_type)
@@ -98,35 +102,36 @@ def run_folder(model, args, config, device, verbose: bool = False):
 
         file_name = os.path.splitext(os.path.basename(path))[0]
 
-        for instr in instruments:
-            estimates = waveforms_orig[instr]
-            if 'normalize' in config.inference:
-                if config.inference['normalize'] is True:
-                    estimates = denormalize_audio(estimates, norm_params)
+        if not args.no_audio_output:
+            for instr in instruments:
+                estimates = waveforms_orig[instr]
+                if 'normalize' in config.inference:
+                    if config.inference['normalize'] is True:
+                        estimates = denormalize_audio(estimates, norm_params)
 
-            codec = 'flac' if getattr(args, 'flac_file', False) else 'wav'
-            subtype = args.pcm_type
+                codec = 'flac' if getattr(args, 'flac_file', False) else 'wav'
+                subtype = args.pcm_type
 
-            dirnames, fname = format_filename(
-                args.filename_template,
-                instr=instr,
-                start_time=int(start_time),
-                file_name=file_name,
-                dir_name=os.path.dirname(path),
-                model_type=args.model_type,
-                model=os.path.splitext(os.path.basename(args.start_check_point))[0]
-            )
+                dirnames, fname = format_filename(
+                    args.filename_template,
+                    instr=instr,
+                    start_time=int(start_time),
+                    file_name=file_name,
+                    dir_name=os.path.dirname(path),
+                    model_type=args.model_type,
+                    model=os.path.splitext(os.path.basename(args.start_check_point))[0]
+                )
 
-            output_dir = os.path.join(args.store_dir, *dirnames)
-            os.makedirs(output_dir, exist_ok=True)
+                output_dir = os.path.join(args.store_dir, *dirnames)
+                os.makedirs(output_dir, exist_ok=True)
 
-            output_path = os.path.join(output_dir, f"{fname}.{codec}")
-            sf.write(output_path, estimates.T, sr, subtype=subtype)
-            print("Wrote file:", output_path)
-            if args.draw_spectro > 0:
-                output_img_path = os.path.join(output_dir, f"{fname}.jpg")
-                draw_spectrogram(estimates.T, sr, args.draw_spectro, output_img_path)
-                print("Wrote file:", output_img_path)
+                output_path = os.path.join(output_dir, f"{fname}.{codec}")
+                sf.write(output_path, estimates.T, sr, subtype=subtype)
+                print("Wrote file:", output_path)
+                if args.draw_spectro > 0:
+                    output_img_path = os.path.join(output_dir, f"{fname}.jpg")
+                    draw_spectrogram(estimates.T, sr, args.draw_spectro, output_img_path)
+                    print("Wrote file:", output_img_path)
 
     print(f"Elapsed time: {time.time() - start_time:.2f} seconds.")
 

@@ -100,9 +100,10 @@ def process_folder(src_folder: str, dest_folder: str, stems: List[str], trim: bo
             sample_rate = sr
             min_length = min(min_length, len(other_combined_data))
 
-        # If no stems were found, set a default sample rate
+        # If no stems were found, set a default sample rate and min_length
         if sample_rate is None:
             sample_rate = 44100
+        if min_length == float('inf'):
             min_length = 0
 
         # Second pass: trim all stems to min_length and save

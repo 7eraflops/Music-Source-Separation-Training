@@ -31,8 +31,8 @@ huggingface-hub>=0.23.0
 prodigyopt
 torch_log_wmse
 loralib
-pyaudio
-wxpython==4.2.2
+# pyaudio
+# wxpython==4.2.2
 keyboard
 matplotlib
 hyper_connections==0.1.11

@@ -25,6 +25,7 @@ from valid import valid_multi_gpu, valid
 import warnings
 
 warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
 
 def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.Namespace,
@@ -266,6 +267,8 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
     else:
         initialize_environment(args.seed, args.results_path)
     model, config = get_model_from_config(args.model_type, args.config_path)
+    if 'model_type' in config.training:
+        args.model_type = config.training.model_type
     use_amp = getattr(config.training, 'use_amp', True)
     device_ids = args.device_ids
     if ddp:

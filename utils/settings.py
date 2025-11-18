@@ -1,21 +1,25 @@
+import argparse
 import os
 import random
-import time
-import yaml
-import wandb
-import numpy as np
-import torch
-import argparse
 import socket
+import time
 from typing import Dict, List, Tuple, Union
-from omegaconf import OmegaConf
-from ml_collections import ConfigDict
-import torch.distributed as dist
-from torch import nn
+
+import numpy as np
 import soundfile as sf
+import torch
+import torch.distributed as dist
+import yaml
+from ml_collections import ConfigDict
+from omegaconf import OmegaConf
+from torch import nn
+
+import wandb
 
 
-def parse_args_train(dict_args: Union[argparse.Namespace, Dict, None]) -> argparse.Namespace:
+def parse_args_train(
+    dict_args: Union[argparse.Namespace, Dict, None],
+) -> argparse.Namespace:
     """
     Parse command-line arguments for training configuration.
 
@@ -32,70 +36,207 @@ def parse_args_train(dict_args: Union[argparse.Namespace, Dict, None]) -> argpar
         values required for training.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default='mdx23c',
-                        help="One of mdx23c, htdemucs, segm_models, mel_band_roformer, bs_roformer, swin_upernet, bandit")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="mdx23c",
+        help="One of mdx23c, htdemucs, segm_models, mel_band_roformer, bs_roformer, swin_upernet, bandit",
+    )
     parser.add_argument("--config_path", type=str, help="path to config file")
-    parser.add_argument("--start_check_point", type=str, default='', help="Initial checkpoint to start training")
-    parser.add_argument("--load_optimizer", action='store_true',
-                        help="Load optimizer state from checkpoint (if available)")
-    parser.add_argument("--load_scheduler", action='store_true',
-                        help="Load scheduler state from checkpoint (if available)")
-    parser.add_argument("--load_epoch", action='store_true', help="Load epoch number from checkpoint (if available)")
-    parser.add_argument("--load_best_metric", action='store_true',
-                        help="Load best metric from checkpoint (if available)")
-    parser.add_argument("--load_all_metrics", action='store_true',
-                        help="Load all metrics from checkpoint (if available)")
-    parser.add_argument("--load_all_losses", action='store_true',
-                        help="Load all losses from checkpoint (if available)")
-    parser.add_argument("--results_path", type=str,
-                        help="path to folder where results will be stored (weights, metadata)")
-    parser.add_argument("--data_path", nargs="+", type=str, help="Dataset data paths. You can provide several folders.")
-    parser.add_argument("--dataset_type", type=int, default=1,
-                        help="Dataset type. Must be one of: 1, 2, 3 or 4. Details here: https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/docs/dataset_types.md")
-    parser.add_argument("--valid_path", nargs="+", type=str,
-                        help="validation data paths. You can provide several folders.")
-    parser.add_argument("--num_workers", type=int, default=0, help="dataloader num_workers")
-    parser.add_argument("--pin_memory", action='store_true', help="dataloader pin_memory")
+    parser.add_argument(
+        "--start_check_point",
+        type=str,
+        default="",
+        help="Initial checkpoint to start training",
+    )
+    parser.add_argument(
+        "--load_optimizer",
+        action="store_true",
+        help="Load optimizer state from checkpoint (if available)",
+    )
+    parser.add_argument(
+        "--load_scheduler",
+        action="store_true",
+        help="Load scheduler state from checkpoint (if available)",
+    )
+    parser.add_argument(
+        "--load_epoch",
+        action="store_true",
+        help="Load epoch number from checkpoint (if available)",
+    )
+    parser.add_argument(
+        "--load_best_metric",
+        action="store_true",
+        help="Load best metric from checkpoint (if available)",
+    )
+    parser.add_argument(
+        "--load_all_metrics",
+        action="store_true",
+        help="Load all metrics from checkpoint (if available)",
+    )
+    parser.add_argument(
+        "--load_all_losses",
+        action="store_true",
+        help="Load all losses from checkpoint (if available)",
+    )
+    parser.add_argument(
+        "--results_path",
+        type=str,
+        help="path to folder where results will be stored (weights, metadata)",
+    )
+    parser.add_argument(
+        "--data_path",
+        nargs="+",
+        type=str,
+        help="Dataset data paths. You can provide several folders.",
+    )
+    parser.add_argument(
+        "--dataset_type",
+        type=int,
+        default=1,
+        help="Dataset type. Must be one of: 1, 2, 3 or 4. Details here: https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/docs/dataset_types.md",
+    )
+    parser.add_argument(
+        "--valid_path",
+        nargs="+",
+        type=str,
+        help="validation data paths. You can provide several folders.",
+    )
+    parser.add_argument(
+        "--num_workers", type=int, default=0, help="dataloader num_workers"
+    )
+    parser.add_argument(
+        "--pin_memory", action="store_true", help="dataloader pin_memory"
+    )
     parser.add_argument("--seed", type=int, default=0, help="random seed")
-    parser.add_argument("--device_ids", nargs='+', type=int, default=[0], help='list of gpu ids')
-    parser.add_argument("--loss", type=str, nargs='+', choices=['masked_loss', 'mse_loss', 'l1_loss',
-                                                                'multistft_loss', 'spec_masked_loss', 'spec_rmse_loss',
-                                                                'log_wmse_loss'],
-                        default=['masked_loss'], help="List of loss functions to use")
-    parser.add_argument("--masked_loss_coef", type=float, default=1., help="Coef for loss")
-    parser.add_argument("--mse_loss_coef", type=float, default=1., help="Coef for loss")
-    parser.add_argument("--l1_loss_coef", type=float, default=1., help="Coef for loss")
-    parser.add_argument("--log_wmse_loss_coef", type=float, default=1., help="Coef for loss")
-    parser.add_argument("--multistft_loss_coef", type=float, default=0.001, help="Coef for loss")
-    parser.add_argument("--spec_masked_loss_coef", type=float, default=1, help="Coef for loss")
-    parser.add_argument("--spec_rmse_loss_coef", type=float, default=1, help="Coef for loss")
-    parser.add_argument("--wandb_key", type=str, default='', help='wandb API Key')
-    parser.add_argument("--wandb_offline", action='store_true', help='local wandb')
-    parser.add_argument("--pre_valid", action='store_true', help='Run validation before training')
-    parser.add_argument("--metrics", nargs='+', type=str, default=["sdr"],
-                        choices=['sdr', 'l1_freq', 'si_sdr', 'log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless',
-                                 'fullness'], help='List of metrics to use.')
-    parser.add_argument("--metric_for_scheduler", default="sdr",
-                        choices=['sdr', 'l1_freq', 'si_sdr', 'log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless',
-                                 'fullness'], help='Metric which will be used for scheduler.')
-    parser.add_argument("--train_lora_peft", action='store_true', help="Training with LoRA from peft")
-    parser.add_argument("--train_lora_loralib", action='store_true', help="Training with LoRA from loralib")
-    parser.add_argument("--lora_checkpoint_peft", type=str, default='', help="Initial checkpoint to LoRA weights")
-    parser.add_argument("--lora_checkpoint_loralib", type=str, default='', help="Initial checkpoint to LoRA weights")
-    parser.add_argument("--each_metrics_in_name", action='store_true',
-                        help="All stems in naming checkpoints")
-    parser.add_argument("--use_standard_loss", action='store_true',
-                        help="Roformers will use provided loss instead of internal")
-    parser.add_argument("--save_weights_every_epoch", action='store_true',
-                        help="Weights will be saved every epoch with all metric values")
-    parser.add_argument("--persistent_workers", action='store_true',
-                        help="dataloader persistent_workers")
-    parser.add_argument("--prefetch_factor", type=int, default=None,
-                        help="dataloader prefetch_factor")
-    parser.add_argument("--set_per_process_memory_fraction", action='store_true',
-                        help="using only VRAM, no RAM")
-    parser.add_argument("--load_only_compatible_weights", action='store_true',
-                        help="using only VRAM, no RAM")
+    parser.add_argument(
+        "--device_ids", nargs="+", type=int, default=[0], help="list of gpu ids"
+    )
+    parser.add_argument(
+        "--loss",
+        type=str,
+        nargs="+",
+        choices=[
+            "masked_loss",
+            "mse_loss",
+            "l1_loss",
+            "multistft_loss",
+            "spec_masked_loss",
+            "spec_rmse_loss",
+            "log_wmse_loss",
+        ],
+        default=["masked_loss"],
+        help="List of loss functions to use",
+    )
+    parser.add_argument(
+        "--masked_loss_coef", type=float, default=1.0, help="Coef for loss"
+    )
+    parser.add_argument(
+        "--mse_loss_coef", type=float, default=1.0, help="Coef for loss"
+    )
+    parser.add_argument("--l1_loss_coef", type=float, default=1.0, help="Coef for loss")
+    parser.add_argument(
+        "--log_wmse_loss_coef", type=float, default=1.0, help="Coef for loss"
+    )
+    parser.add_argument(
+        "--multistft_loss_coef", type=float, default=0.001, help="Coef for loss"
+    )
+    parser.add_argument(
+        "--spec_masked_loss_coef", type=float, default=1, help="Coef for loss"
+    )
+    parser.add_argument(
+        "--spec_rmse_loss_coef", type=float, default=1, help="Coef for loss"
+    )
+    parser.add_argument("--wandb_key", type=str, default="", help="wandb API Key")
+    parser.add_argument("--wandb_offline", action="store_true", help="local wandb")
+    parser.add_argument(
+        "--pre_valid", action="store_true", help="Run validation before training"
+    )
+    parser.add_argument(
+        "--metrics",
+        nargs="+",
+        type=str,
+        default=["sdr"],
+        choices=[
+            "sdr",
+            "l1_freq",
+            "si_sdr",
+            "log_wmse",
+            "aura_stft",
+            "aura_mrstft",
+            "bleedless",
+            "fullness",
+        ],
+        help="List of metrics to use.",
+    )
+    parser.add_argument(
+        "--metric_for_scheduler",
+        default="sdr",
+        choices=[
+            "sdr",
+            "l1_freq",
+            "si_sdr",
+            "log_wmse",
+            "aura_stft",
+            "aura_mrstft",
+            "bleedless",
+            "fullness",
+        ],
+        help="Metric which will be used for scheduler.",
+    )
+    parser.add_argument(
+        "--train_lora_peft", action="store_true", help="Training with LoRA from peft"
+    )
+    parser.add_argument(
+        "--train_lora_loralib",
+        action="store_true",
+        help="Training with LoRA from loralib",
+    )
+    parser.add_argument(
+        "--lora_checkpoint_peft",
+        type=str,
+        default="",
+        help="Initial checkpoint to LoRA weights",
+    )
+    parser.add_argument(
+        "--lora_checkpoint_loralib",
+        type=str,
+        default="",
+        help="Initial checkpoint to LoRA weights",
+    )
+    parser.add_argument(
+        "--each_metrics_in_name",
+        action="store_true",
+        help="All stems in naming checkpoints",
+    )
+    parser.add_argument(
+        "--use_standard_loss",
+        action="store_true",
+        help="Roformers will use provided loss instead of internal",
+    )
+    parser.add_argument(
+        "--save_weights_every_epoch",
+        action="store_true",
+        help="Weights will be saved every epoch with all metric values",
+    )
+    parser.add_argument(
+        "--persistent_workers",
+        action="store_true",
+        help="dataloader persistent_workers",
+    )
+    parser.add_argument(
+        "--prefetch_factor", type=int, default=None, help="dataloader prefetch_factor"
+    )
+    parser.add_argument(
+        "--set_per_process_memory_fraction",
+        action="store_true",
+        help="using only VRAM, no RAM",
+    )
+    parser.add_argument(
+        "--load_only_compatible_weights",
+        action="store_true",
+        help="using only VRAM, no RAM",
+    )
 
     if dict_args is not None:
         args = parser.parse_args([])
@@ -108,10 +249,11 @@ def parse_args_train(dict_args: Union[argparse.Namespace, Dict, None]) -> argpar
     if args.metric_for_scheduler not in args.metrics:
         args.metrics += [args.metric_for_scheduler]
 
-    get_internal_loss = (args.model_type in ('mel_band_conformer',) or 'roformer' in args.model_type
-                         ) and not args.use_standard_loss
+    get_internal_loss = (
+        args.model_type in ("mel_band_conformer",) or "roformer" in args.model_type
+    ) and not args.use_standard_loss
     if get_internal_loss:
-        args.loss = [f'{args.model_type}_loss']
+        args.loss = [f"{args.model_type}_loss"]
     return args
 
 
@@ -133,30 +275,78 @@ def parse_args_valid(dict_args: Union[Dict, None]) -> argparse.Namespace:
         configuration values.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default='mdx23c',
-                        help="One of mdx23c, htdemucs, segm_models, mel_band_roformer,"
-                             " bs_roformer, swin_upernet, bandit")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="mdx23c",
+        help="One of mdx23c, htdemucs, segm_models, mel_band_roformer,"
+        " bs_roformer, swin_upernet, bandit",
+    )
     parser.add_argument("--config_path", type=str, help="Path to config file")
-    parser.add_argument("--start_check_point", type=str, default='', help="Initial checkpoint"
-                                                                          " to valid weights")
+    parser.add_argument(
+        "--start_check_point",
+        type=str,
+        default="",
+        help="Initial checkpoint to valid weights",
+    )
     parser.add_argument("--valid_path", nargs="+", type=str, help="Validate path")
-    parser.add_argument("--store_dir", type=str, default="", help="Path to store results as wav file")
-    parser.add_argument("--draw_spectro", type=float, default=0,
-                        help="If --store_dir is set then code will generate spectrograms for resulted stems as well."
-                             " Value defines for how many seconds os track spectrogram will be generated.")
-    parser.add_argument("--device_ids", nargs='+', type=int, default=[0], help='List of gpu ids')
-    parser.add_argument("--num_workers", type=int, default=0, help="Dataloader num_workers")
-    parser.add_argument("--pin_memory", action='store_true', help="Dataloader pin_memory")
-    parser.add_argument("--extension", type=str, default='wav', help="Choose extension for validation")
-    parser.add_argument("--use_tta", action='store_true',
-                        help="Flag adds test time augmentation during inference (polarity and channel inverse)."
-                             "While this triples the runtime, it reduces noise and slightly improves prediction quality.")
-    parser.add_argument("--metrics", nargs='+', type=str, default=["sdr"],
-                        choices=['sdr', 'l1_freq', 'si_sdr', 'neg_log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless',
-                                 'fullness'], help='List of metrics to use.')
-    parser.add_argument("--lora_checkpoint_peft", type=str, default='', help="Initial checkpoint to LoRA weights")
-    parser.add_argument("--lora_checkpoint_loralib", type=str, default='', help="Initial checkpoint to LoRA weights")
-
+    parser.add_argument(
+        "--store_dir", type=str, default="", help="Path to store results as wav file"
+    )
+    parser.add_argument(
+        "--draw_spectro",
+        type=float,
+        default=0,
+        help="If --store_dir is set then code will generate spectrograms for resulted stems as well."
+        " Value defines for how many seconds os track spectrogram will be generated.",
+    )
+    parser.add_argument(
+        "--device_ids", nargs="+", type=int, default=[0], help="List of gpu ids"
+    )
+    parser.add_argument(
+        "--num_workers", type=int, default=0, help="Dataloader num_workers"
+    )
+    parser.add_argument(
+        "--pin_memory", action="store_true", help="Dataloader pin_memory"
+    )
+    parser.add_argument(
+        "--extension", type=str, default="wav", help="Choose extension for validation"
+    )
+    parser.add_argument(
+        "--use_tta",
+        action="store_true",
+        help="Flag adds test time augmentation during inference (polarity and channel inverse)."
+        "While this triples the runtime, it reduces noise and slightly improves prediction quality.",
+    )
+    parser.add_argument(
+        "--metrics",
+        nargs="+",
+        type=str,
+        default=["sdr"],
+        choices=[
+            "sdr",
+            "l1_freq",
+            "si_sdr",
+            "neg_log_wmse",
+            "aura_stft",
+            "aura_mrstft",
+            "bleedless",
+            "fullness",
+        ],
+        help="List of metrics to use.",
+    )
+    parser.add_argument(
+        "--lora_checkpoint_peft",
+        type=str,
+        default="",
+        help="Initial checkpoint to LoRA weights",
+    )
+    parser.add_argument(
+        "--lora_checkpoint_loralib",
+        type=str,
+        default="",
+        help="Initial checkpoint to LoRA weights",
+    )
 
     if dict_args is not None:
         args = parser.parse_args([])
@@ -187,31 +377,91 @@ def parse_args_inference(dict_args: Union[Dict, None]) -> argparse.Namespace:
         configuration values.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default='mdx23c',
-                        help="One of bandit, bandit_v2, bs_roformer, htdemucs, mdx23c, mel_band_roformer,"
-                             " scnet, scnet_unofficial, segm_models, swin_upernet, torchseg")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="mdx23c",
+        help="One of bandit, bandit_v2, bs_roformer, htdemucs, mdx23c, mel_band_roformer,"
+        " scnet, scnet_unofficial, segm_models, swin_upernet, torchseg",
+    )
     parser.add_argument("--config_path", type=str, help="path to config file")
-    parser.add_argument("--start_check_point", type=str, default='', help="Initial checkpoint to valid weights")
-    parser.add_argument("--input_folder", type=str, help="folder with mixtures to process")
-    parser.add_argument("--store_dir", type=str, default="", help="path to store results as wav file")
-    parser.add_argument("--draw_spectro", type=float, default=0,
-                        help="Code will generate spectrograms for resulted stems."
-                             " Value defines for how many seconds os track spectrogram will be generated.")
-    parser.add_argument("--device_ids", nargs='+', type=int, default=0, help='list of gpu ids')
-    parser.add_argument("--extract_instrumental", action='store_true',
-                        help="invert vocals to get instrumental if provided")
-    parser.add_argument("--disable_detailed_pbar", action='store_true', help="disable detailed progress bar")
-    parser.add_argument("--force_cpu", action='store_true', help="Force the use of CPU even if CUDA is available")
-    parser.add_argument("--flac_file", action='store_true', help="Output flac file instead of wav")
-    parser.add_argument("--pcm_type", type=str, choices=['PCM_16', 'PCM_24', 'FLOAT'], default='FLOAT',
-                        help="PCM type for FLAC files (PCM_16 or PCM_24)")
-    parser.add_argument("--use_tta", action='store_true',
-                        help="Flag adds test time augmentation during inference (polarity and channel inverse)."
-                        "While this triples the runtime, it reduces noise and slightly improves prediction quality.")
-    parser.add_argument("--lora_checkpoint_peft", type=str, default='', help="Initial checkpoint to LoRA weights")
-    parser.add_argument("--filename_template", type=str, default='{file_name}/{instr}',
-                        help="Output filename template, without extension, using '/' for subdirectories. Default: '{file_name}/{instr}'")
-    parser.add_argument("--lora_checkpoint_loralib", type=str, default='', help="Initial checkpoint to LoRA weights")
+    parser.add_argument(
+        "--start_check_point",
+        type=str,
+        default="",
+        help="Initial checkpoint to valid weights",
+    )
+    parser.add_argument(
+        "--input_folder", type=str, help="folder with mixtures to process"
+    )
+    parser.add_argument(
+        "--store_dir", type=str, default="", help="path to store results as wav file"
+    )
+    parser.add_argument(
+        "--draw_spectro",
+        type=float,
+        default=0,
+        help="Code will generate spectrograms for resulted stems."
+        " Value defines for how many seconds os track spectrogram will be generated.",
+    )
+    parser.add_argument(
+        "--device_ids", nargs="+", type=int, default=0, help="list of gpu ids"
+    )
+    parser.add_argument(
+        "--extract_instrumental",
+        action="store_true",
+        help="invert vocals to get instrumental if provided",
+    )
+    parser.add_argument(
+        "--disable_detailed_pbar",
+        action="store_true",
+        help="disable detailed progress bar",
+    )
+    parser.add_argument(
+        "--force_cpu",
+        action="store_true",
+        help="Force the use of CPU even if CUDA is available",
+    )
+    parser.add_argument(
+        "--flac_file", action="store_true", help="Output flac file instead of wav"
+    )
+    parser.add_argument(
+        "--pcm_type",
+        type=str,
+        choices=["PCM_16", "PCM_24", "FLOAT"],
+        default="FLOAT",
+        help="PCM type for FLAC files (PCM_16 or PCM_24)",
+    )
+    parser.add_argument(
+        "--use_tta",
+        action="store_true",
+        help="Flag adds test time augmentation during inference (polarity and channel inverse)."
+        "While this triples the runtime, it reduces noise and slightly improves prediction quality.",
+    )
+    parser.add_argument(
+        "--lora_checkpoint_peft",
+        type=str,
+        default="",
+        help="Initial checkpoint to LoRA weights",
+    )
+    parser.add_argument(
+        "--filename_template",
+        type=str,
+        default="{file_name}/{instr}",
+        help="Output filename template, without extension, using '/' for subdirectories. Default: '{file_name}/{instr}'",
+    )
+    parser.add_argument(
+        "--lora_checkpoint_loralib",
+        type=str,
+        default="",
+        help="Initial checkpoint to LoRA weights",
+    )
+    parser.add_argument(
+        "--save_latents_path", type=str, default="", help="path to store latent files"
+    )
+    parser.add_argument(
+        "--no_audio_output", action="store_true", help="Do not save output audio files"
+    )
     if dict_args is not None:
         args = parser.parse_args([])
         args_dict = vars(args)
@@ -225,12 +475,14 @@ def parse_args_inference(dict_args: Union[Dict, None]) -> argparse.Namespace:
 
 
 def validate_sndfile_subtype(args):
-    codec = 'flac' if getattr(args, 'flac_file', False) else 'wav'
+    codec = "flac" if getattr(args, "flac_file", False) else "wav"
     subtype = args.pcm_type
     if subtype in sf.available_subtypes(codec):
         return subtype
     default = sf.default_subtype(codec)
-    print(f"WARNING: codec {codec} doesn't support subtype {subtype}, defaulting to {default}")
+    print(
+        f"WARNING: codec {codec} doesn't support subtype {subtype}, defaulting to {default}"
+    )
     return default
 
 
@@ -254,8 +506,8 @@ def load_config(model_type: str, config_path: str) -> Union[ConfigDict, OmegaCon
         ValueError: If the configuration cannot be parsed or is otherwise invalid.
     """
     try:
-        with open(config_path, 'r') as f:
-            if model_type == 'htdemucs':
+        with open(config_path, "r") as f:
+            if model_type == "htdemucs":
                 config = OmegaConf.load(config_path)
             else:
                 config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
@@ -266,7 +518,9 @@ def load_config(model_type: str, config_path: str) -> Union[ConfigDict, OmegaCon
         raise ValueError(f"Error loading configuration: {e}")
 
 
-def get_model_from_config(model_type: str, config_path: str) -> Tuple[nn.Module, Union[ConfigDict, OmegaConf]]:
+def get_model_from_config(
+    model_type: str, config_path: str
+) -> Tuple[nn.Module, Union[ConfigDict, OmegaConf]]:
     """
     Load and instantiate a model using a configuration file.
 
@@ -291,77 +545,99 @@ def get_model_from_config(model_type: str, config_path: str) -> Tuple[nn.Module,
 
     config = load_config(model_type, config_path)
 
-    if model_type == 'mdx23c':
+    if model_type == "mdx23c":
         from models.mdx23c_tfc_tdf_v3 import TFC_TDF_net
+
         model = TFC_TDF_net(config)
-    elif model_type == 'htdemucs':
+    elif model_type == "htdemucs":
         from models.demucs4ht import get_model
+
         model = get_model(config)
-    elif model_type == 'segm_models':
+    elif model_type == "segm_models":
         from models.segm_models import Segm_Models_Net
+
         model = Segm_Models_Net(config)
-    elif model_type == 'torchseg':
+    elif model_type == "torchseg":
         from models.torchseg_models import Torchseg_Net
+
         model = Torchseg_Net(config)
-    elif model_type == 'mel_band_roformer':
+    elif model_type == "mel_band_roformer":
         from models.bs_roformer import MelBandRoformer
+
         model = MelBandRoformer(**dict(config.model))
-    elif model_type == 'mel_band_conformer':
+    elif model_type == "mel_band_conformer":
         from models.bs_roformer import MelBandConformer
+
         model = MelBandConformer(**dict(config.model))
-    elif model_type == 'mel_band_roformer_experimental':
+    elif model_type == "mel_band_roformer_experimental":
         from models.bs_roformer.mel_band_roformer_experimental import MelBandRoformer
+
         model = MelBandRoformer(**dict(config.model))
-    elif model_type == 'bs_roformer':
+    elif model_type == "bs_roformer":
         from models.bs_roformer import BSRoformer
+
         model = BSRoformer(**dict(config.model))
-    elif model_type == 'bs_conformer':
+    elif model_type == "bs_conformer":
         from models.bs_roformer import BSConformer
+
         model = BSConformer(**dict(config.model))
-    elif model_type == 'bs_roformer_experimental':
+    elif model_type == "bs_roformer_experimental":
         from models.bs_roformer.bs_roformer_experimental import BSRoformer
+
         model = BSRoformer(**dict(config.model))
-    elif model_type == 'swin_upernet':
+    elif model_type == "swin_upernet":
         from models.upernet_swin_transformers import Swin_UperNet_Model
+
         model = Swin_UperNet_Model(config)
-    elif model_type == 'bandit':
+    elif model_type == "bandit":
         from models.bandit.core.model import MultiMaskMultiSourceBandSplitRNNSimple
+
         model = MultiMaskMultiSourceBandSplitRNNSimple(**config.model)
-    elif model_type == 'bandit_v2':
+    elif model_type == "bandit_v2":
         from models.bandit_v2.bandit import Bandit
+
         model = Bandit(**config.kwargs)
-    elif model_type == 'scnet_unofficial':
+    elif model_type == "scnet_unofficial":
         from models.scnet_unofficial import SCNet
+
         model = SCNet(**config.model)
-    elif model_type == 'scnet':
+    elif model_type == "scnet":
         from models.scnet import SCNet
+
         model = SCNet(**config.model)
-    elif model_type == 'scnet_tran':
+    elif model_type == "scnet_tran":
         from models.scnet.scnet_tran import SCNet_Tran
+
         model = SCNet_Tran(**config.model)
-    elif model_type == 'apollo':
+    elif model_type == "apollo":
         from models.look2hear.models import BaseModel
+
         model = BaseModel.apollo(**config.model)
-    elif model_type == 'bs_mamba2':
+    elif model_type == "bs_mamba2":
         from models.ts_bs_mamba2 import Separator
+
         model = Separator(**config.model)
-    elif model_type == 'experimental_mdx23c_stht':
+    elif model_type == "experimental_mdx23c_stht":
         from models.mdx23c_tfc_tdf_v3_with_STHT import TFC_TDF_net
+
         model = TFC_TDF_net(config)
-    elif model_type == 'scnet_masked':
+    elif model_type == "scnet_masked":
         from models.scnet.scnet_masked import SCNet
+
         model = SCNet(**config.model)
-    elif model_type == 'conformer':
+    elif model_type == "conformer":
         from models.conformer_model import ConformerMSS, NeuralModel
+
         model = ConformerMSS(
             core=NeuralModel(**config.model),
             n_fft=config.stft.n_fft,
             hop_length=config.stft.hop_length,
-            win_length=getattr(config.stft, 'win_length', config.stft.n_fft),
-            center=config.stft.center
+            win_length=getattr(config.stft, "win_length", config.stft.n_fft),
+            center=config.stft.center,
         )
-    elif model_type == 'mel_band_conformer':
+    elif model_type == "mel_band_conformer":
         from models.mel_band_conformer import MelBandConformer
+
         model = MelBandConformer(**config.model)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
@@ -370,22 +646,28 @@ def get_model_from_config(model_type: str, config_path: str) -> Tuple[nn.Module,
 
 
 def get_scheduler(config, optimizer):
-    scheduler_name = config.training.get('scheduler', 'ReduceLROnPlateau')
-    if scheduler_name == 'linear_scheduler':
+    scheduler_name = config.training.get("scheduler", "ReduceLROnPlateau")
+    if scheduler_name == "linear_scheduler":
         from transformers import get_linear_schedule_with_warmup
+
         num_training_steps = config.training.num_epochs * config.training.num_steps
         num_warmup_steps = config.training.num_warmup_steps
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps
+            num_training_steps=num_training_steps,
         )
-    elif scheduler_name == 'ReduceLROnPlateau':
+    elif scheduler_name == "ReduceLROnPlateau":
         from torch.optim.lr_scheduler import ReduceLROnPlateau
-        scheduler = ReduceLROnPlateau(optimizer, 'max', patience=config.training.patience,
-                                      factor=config.training.reduce_factor)
+
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            "max",
+            patience=config.training.patience,
+            factor=config.training.reduce_factor,
+        )
     else:
-        available_schedulers = ['linear_scheduler', 'ReduceLROnPlateau']
+        available_schedulers = ["linear_scheduler", "ReduceLROnPlateau"]
         raise ValueError(
             f"Unknown scheduler '{scheduler_name}'. "
             f"Available options: {available_schedulers}. "
@@ -436,7 +718,7 @@ def write_results_in_file(store_dir: str, logs: List[str]) -> None:
         None
     """
     if not dist.is_initialized() or dist.get_rank() == 0:
-        with open(f'{store_dir}/results.txt', 'w') as out:
+        with open(f"{store_dir}/results.txt", "w") as out:
             for item in logs:
                 out.write(item + "\n")
 
@@ -485,13 +767,15 @@ def initialize_environment(seed: int, results_path: str) -> None:
     manual_seed(seed)
     torch.backends.cudnn.deterministic = False
     try:
-        torch.multiprocessing.set_start_method('spawn')
+        torch.multiprocessing.set_start_method("spawn")
     except Exception as e:
         pass
     os.makedirs(results_path, exist_ok=True)
 
 
-def initialize_environment_ddp(rank: int, world_size: int, seed: int = 0, resuls_path: str = None) -> None:
+def initialize_environment_ddp(
+    rank: int, world_size: int, seed: int = 0, resuls_path: str = None
+) -> None:
     """
     Initialize environment for Distributed Data Parallel (DDP) training/validation.
 
@@ -514,7 +798,9 @@ def initialize_environment_ddp(rank: int, world_size: int, seed: int = 0, resuls
     manual_seed(seed)
 
     try:
-        torch.multiprocessing.set_start_method('spawn', force=True)  # force=True prevent errors
+        torch.multiprocessing.set_start_method(
+            "spawn", force=True
+        )  # force=True prevent errors
     except RuntimeError as e:
         if "context has already been set" not in str(e):
             raise e
@@ -538,13 +824,15 @@ def gen_wandb_name(args, config) -> str:
             "<model_type>_[<instrument1>-<instrument2>-...]_<YYYY-MM-DD>".
     """
 
-    instrum = '-'.join(config['training']['instruments'])
+    instrum = "-".join(config["training"]["instruments"])
     time_str = time.strftime("%Y-%m-%d")
-    name = '{}_[{}]_{}'.format(args.model_type, instrum, time_str)
+    name = "{}_[{}]_{}".format(args.model_type, instrum, time_str)
     return name
 
 
-def wandb_init(args: argparse.Namespace, config: Union[ConfigDict, OmegaConf], batch_size: int) -> None:
+def wandb_init(
+    args: argparse.Namespace, config: Union[ConfigDict, OmegaConf], batch_size: int
+) -> None:
     """
     Initialize Weights & Biases (wandb) for experiment tracking.
 
@@ -564,25 +852,36 @@ def wandb_init(args: argparse.Namespace, config: Union[ConfigDict, OmegaConf], b
     """
 
     if args.wandb_offline:
-        wandb.init(mode='offline',
-                   project='msst',
-                   name=gen_wandb_name(args, config),
-                   config={'config': config, 'args': args, 'device_ids': args.device_ids, 'batch_size': batch_size}
-                   )
-    elif args.wandb_key is None or args.wandb_key.strip() == '':
-        wandb.init(mode='disabled')
+        wandb.init(
+            mode="offline",
+            project="msst",
+            name=gen_wandb_name(args, config),
+            config={
+                "config": config,
+                "args": args,
+                "device_ids": args.device_ids,
+                "batch_size": batch_size,
+            },
+        )
+    elif args.wandb_key is None or args.wandb_key.strip() == "":
+        wandb.init(mode="disabled")
     else:
         wandb.login(key=args.wandb_key)
         wandb.init(
-            project='msst',
+            project="msst",
             name=gen_wandb_name(args, config),
-            config={'config': config, 'args': args, 'device_ids': args.device_ids, 'batch_size': batch_size}
+            config={
+                "config": config,
+                "args": args,
+                "device_ids": args.device_ids,
+                "batch_size": batch_size,
+            },
         )
 
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))              # 0 → OS chooses free port
+        s.bind(("", 0))  # 0 → OS chooses free port
         return s.getsockname()[1]
 
 
@@ -602,18 +901,54 @@ def setup_ddp(rank: int, world_size: int) -> None:
     Returns:
         None
     """
+    import datetime
 
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12345'
-    os.environ["USE_LIBUV"] = "0"
-    try:
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    except:
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
-        if dist.get_rank() == 0:
-            print(f'NCCL are not available. Using "gloo" backend.')
-
+    # Set CUDA device first
     torch.cuda.set_device(rank)
+
+    # Environment variables for mp.spawn compatibility
+    # These must be set before init_process_group for mp.spawn
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "12345"
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["RANK"] = str(rank)
+    os.environ["USE_LIBUV"] = "0"
+
+    # Force IPv4 for both NCCL and c10d
+    os.environ.setdefault("NCCL_SOCKET_FAMILY", "AF_INET")
+    os.environ.setdefault("GLOO_SOCKET_FAMILY", "AF_INET")
+
+    if rank == 0:
+        print(f"Initializing DDP: rank={rank}, world_size={world_size}")
+        print(f"MASTER_ADDR={os.environ.get('MASTER_ADDR')}")
+        print(f"NCCL_SOCKET_FAMILY={os.environ.get('NCCL_SOCKET_FAMILY')}")
+        print(f"CUDA Device: {torch.cuda.current_device()}")
+
+    # Use env:// init method for mp.spawn compatibility
+    try:
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            timeout=datetime.timedelta(seconds=1800),
+        )
+        if rank == 0:
+            print(f"✓ NCCL backend initialized successfully")
+            print(f"  Backend: {dist.get_backend()}")
+    except Exception as e:
+        if rank == 0:
+            print(f"✗ NCCL initialization failed: {e}")
+            print(
+                f"  Falling back to Gloo backend (WARNING: This will be MUCH slower!)"
+            )
+
+        dist.init_process_group(
+            backend="gloo",
+            init_method="env://",
+            timeout=datetime.timedelta(seconds=1800),
+        )
+        if rank == 0:
+            print(f"✓ Gloo backend initialized (expect slow training)")
+            print(f"  Backend: {dist.get_backend()}")
 
 
 def cleanup_ddp() -> None:

@@ -9,6 +9,7 @@ from utils.settings import  cleanup_ddp
 import warnings
 
 warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
 
 def train_model_single(rank: int, world_size: int, args=None):
