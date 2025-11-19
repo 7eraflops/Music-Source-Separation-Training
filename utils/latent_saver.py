@@ -34,8 +34,7 @@ class LatentSaver:
         self.run_name = run_name
         self.hooks = []
         self.collected_latents = {}
-        # New structure to hold skip connections layer-wise
-        self.collected_skips = {"skips": {}, "time_skips": {}}
+        # self.collected_skips = {"skips": {}, "time_skips": {}} # Removed: no longer collecting skips
 
         if self.model_type not in BOTTLENECK_MODULES:
             raise ValueError(
@@ -64,15 +63,13 @@ class LatentSaver:
         else:
             self.collected_latents[module_name].append(output.clone().detach().cpu())
 
-    def _skip_hook_fn(self, output, key, index):
-        # This hook captures skip connections from encoder layers
-        self.collected_skips[key][index].append(output.clone().detach().cpu())
+    # _skip_hook_fn removed: no longer used
 
     def register_hooks(self):
         module_names = BOTTLENECK_MODULES[self.model_type]
         for name, module in self.model.named_modules():
             if name in module_names.values():
-                module_key = [k for k, v in module_names.items() if v == name][0]
+                module_key = [k for k k, v in module_names.items() if v == name][0]
                 if module_key not in self.collected_latents:
                     self.collected_latents[module_key] = []
 
@@ -84,74 +81,36 @@ class LatentSaver:
                 self.hooks.append(hook)
                 print(f"Registered hook for {self.model_type}: {name}")
 
-        # Special handling for htdemucs to also capture skip connections
-        if self.model_type == "htdemucs":
-            print("Registering hooks for htdemucs skip connections...")
-            for i, layer in enumerate(self.model.encoder):
-                self.collected_skips["skips"][i] = []
-                hook = layer.register_forward_hook(
-                    # Use a lambda that captures the current value of i
-                    lambda module, input, output, index=i: self._skip_hook_fn(
-                        output, "skips", index
-                    )
-                )
-                self.hooks.append(hook)
-
-            for i, layer in enumerate(self.model.tencoder):
-                if hasattr(layer, "empty") and not layer.empty:
-                    self.collected_skips["time_skips"][i] = []
-                    hook = layer.register_forward_hook(
-                        lambda module, input, output, index=i: self._skip_hook_fn(
-                            output, "time_skips", index
-                        )
-                    )
-                    self.hooks.append(hook)
-            print("Registered all skip connection hooks.")
+        # Removed: Special handling for htdemucs to capture skip connections
 
     def save_and_remove_hooks(self):
-        # Special case for htdemucs to save everything into one file
+        # Special case for htdemucs to save its bottleneck latents into one file
         if self.model_type == "htdemucs":
             if "crosstransformer" not in self.collected_latents:
                 print("Warning: No htdemucs bottleneck latents were collected.")
                 return
             
-            # 1. Process bottleneck latents (which are lists of chunks)
+            # Process bottleneck latents (which are lists of chunks)
             latents = self.collected_latents["crosstransformer"]
             latents_x = [item[0] for item in latents]
             latents_xt = [item[1] for item in latents]
             full_latent_x = torch.cat(latents_x, dim=3)
             full_latent_xt = torch.cat(latents_xt, dim=2)
 
-            # 2. Process skip connections (which are dicts of lists of chunks)
-            final_skips = []
-            for i in sorted(self.collected_skips["skips"].keys()):
-                # Each element is a list of chunks for that layer
-                concatenated_skip = torch.cat(self.collected_skips["skips"][i], dim=-1)
-                final_skips.append(concatenated_skip)
-
-            final_time_skips = []
-            for i in sorted(self.collected_skips["time_skips"].keys()):
-                concatenated_skip = torch.cat(
-                    self.collected_skips["time_skips"][i], dim=-1
-                )
-                final_time_skips.append(concatenated_skip)
-
-            # 3. Combine everything into a dictionary
+            # Combine just the bottleneck latents into a dictionary
             data_to_save = {
-                "freq_latent": full_latent_x,
-                "time_latent": full_latent_xt,
-                "skips": final_skips,
-                "time_skips": final_time_skips,
+                'freq_latent': full_latent_x,
+                'time_latent': full_latent_xt,
             }
 
-            # 4. Save to a single file
+            # Save to a single file
             path = self._get_save_path()
             os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save(data_to_save, path)
-            print(f"Saved all htdemucs latents and skips to {path}")
+            print(f"Saved htdemucs bottleneck latents to {path}")
 
         else:
-            # Original logic for other models, adjusted to save as track_name.pt
+            # Logic for other models (scnet, bs_roformer)
             for module_name, latents in self.collected_latents.items():
                 if not latents:
                     continue
@@ -171,7 +130,7 @@ class LatentSaver:
             hook.remove()
         self.hooks = []
         self.collected_latents = {}
-        self.collected_skips = {"skips": {}, "time_skips": {}}
+        # self.collected_skips = {"skips": {}, "time_skips": {}} # Removed: no longer used
         print("Removed all hooks.")
 
 
