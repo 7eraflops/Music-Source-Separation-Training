@@ -69,7 +69,7 @@ class LatentSaver:
         module_names = BOTTLENECK_MODULES[self.model_type]
         for name, module in self.model.named_modules():
             if name in module_names.values():
-                module_key = [k for k k, v in module_names.items() if v == name][0]
+                module_key = [k for k, v in module_names.items() if v == name][0]
                 if module_key not in self.collected_latents:
                     self.collected_latents[module_key] = []
 
