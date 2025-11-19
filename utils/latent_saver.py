@@ -1,5 +1,6 @@
 import os
 import torch
+import torch.nn.functional as F
 
 BOTTLENECK_MODULES = {
     "bs_roformer": {
@@ -94,6 +95,30 @@ class LatentSaver:
             latents = self.collected_latents["crosstransformer"]
             latents_x = [item[0] for item in latents]
             latents_xt = [item[1] for item in latents]
+
+            # Pad tensors to the same length before concatenation
+            if len(latents_x) > 1:
+                max_len_x = max(t.shape[3] for t in latents_x)
+                padded_latents_x = []
+                for t in latents_x:
+                    pad_len = max_len_x - t.shape[3]
+                    if pad_len > 0:
+                        padded_latents_x.append(F.pad(t, (0, pad_len)))
+                    else:
+                        padded_latents_x.append(t)
+                latents_x = padded_latents_x
+
+            if len(latents_xt) > 1:
+                max_len_xt = max(t.shape[2] for t in latents_xt)
+                padded_latents_xt = []
+                for t in latents_xt:
+                    pad_len = max_len_xt - t.shape[2]
+                    if pad_len > 0:
+                        padded_latents_xt.append(F.pad(t, (0, pad_len)))
+                    else:
+                        padded_latents_xt.append(t)
+                latents_xt = padded_latents_xt
+
             full_latent_x = torch.cat(latents_x, dim=3)
             full_latent_xt = torch.cat(latents_xt, dim=2)
 
@@ -118,6 +143,23 @@ class LatentSaver:
                 time_dim = 1  # bs_roformer (b, t, f, d)
                 if self.model_type == "scnet":
                     time_dim = 3  # scnet (b, c, fr, t)
+                
+                # Also apply padding for other models just in case
+                if len(latents) > 1:
+                    max_len = max(t.shape[time_dim] for t in latents)
+                    padded_latents = []
+                    for t in latents:
+                        pad_len = max_len - t.shape[time_dim]
+                        if pad_len > 0:
+                            # Create a padding tuple dynamically based on the dimension
+                            # (pad_left, pad_right, pad_top, pad_bottom, ...)
+                            # We only pad the last dimension used for time
+                            pad_tuple = [0] * (2 * len(t.shape))
+                            pad_tuple[2 * (len(t.shape) - 1 - time_dim) + 1] = pad_len
+                            padded_latents.append(F.pad(t, tuple(pad_tuple)))
+                        else:
+                            padded_latents.append(t)
+                    latents = padded_latents
 
                 full_latent = torch.cat(latents, dim=time_dim)
                 path = self._get_save_path()
@@ -130,7 +172,6 @@ class LatentSaver:
             hook.remove()
         self.hooks = []
         self.collected_latents = {}
-        # self.collected_skips = {"skips": {}, "time_skips": {}} # Removed: no longer used
         print("Removed all hooks.")
 
 
