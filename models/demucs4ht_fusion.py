@@ -681,35 +681,6 @@ class FusionHTDemucs(nn.Module):
 
             saved.append(x)
         
-        # --- FUSION BLOCK START ---
-        if latents is not None and self.use_latents:
-            # We expect latents dict to contain 'bs_roformer'
-            # Latent Shape Check based on analysis:
-            # BS-Roformer: (B, T, F, C) e.g., (1, 52848, 62, 384)
-            # We need to permute to (B, C, F, T) or (B, C, T)
-            
-            if 'bs_roformer' in latents:
-                rof = latents['bs_roformer'] # (B, T, F, C)
-                
-                # Handle case where DataLoader collates (1, T, F, C) into (B, 1, T, F, C)
-                if rof.dim() == 5 and rof.shape[1] == 1:
-                    rof = rof.squeeze(1)
-                
-                # Prepare for Freq Fusion: (B, C, F, T)
-                # Permute -> (B, C, F, T)
-                rof_freq = rof.permute(0, 3, 2, 1)
-                if self.fusion_freq:
-                    x = self.fusion_freq(x, rof_freq, is_2d=True)
-                    
-                # Prepare for Time Fusion: (B, C, T)
-                # Aggregate Freq dim (mean) -> (B, T, C)
-                rof_time = rof.mean(dim=2)
-                # Permute -> (B, C, T)
-                rof_time = rof_time.permute(0, 2, 1)
-                if self.fusion_time:
-                    xt = self.fusion_time(xt, rof_time, is_2d=False)
-        # --- FUSION BLOCK END ---
-
         if self.crosstransformer:
             if self.bottom_channels:
                 b, c, f, t = x.shape
@@ -717,6 +688,35 @@ class FusionHTDemucs(nn.Module):
                 x = self.channel_upsampler(x)
                 x = rearrange(x, "b c (f t)-> b c f t", f=f)
                 xt = self.channel_upsampler_t(xt)
+
+            # --- FUSION BLOCK START ---
+            if latents is not None and self.use_latents:
+                # We expect latents dict to contain 'bs_roformer'
+                # Latent Shape Check based on analysis:
+                # BS-Roformer: (B, T, F, C) e.g., (1, 52848, 62, 384)
+                # We need to permute to (B, C, F, T) or (B, C, T)
+                
+                if 'bs_roformer' in latents:
+                    rof = latents['bs_roformer'] # (B, T, F, C)
+                    
+                    # Handle case where DataLoader collates (1, T, F, C) into (B, 1, T, F, C)
+                    if rof.dim() == 5 and rof.shape[1] == 1:
+                        rof = rof.squeeze(1)
+                    
+                    # Prepare for Freq Fusion: (B, C, F, T)
+                    # Permute -> (B, C, F, T)
+                    rof_freq = rof.permute(0, 3, 2, 1)
+                    if self.fusion_freq:
+                        x = self.fusion_freq(x, rof_freq, is_2d=True)
+                        
+                    # Prepare for Time Fusion: (B, C, T)
+                    # Aggregate Freq dim (mean) -> (B, T, C)
+                    rof_time = rof.mean(dim=2)
+                    # Permute -> (B, C, T)
+                    rof_time = rof_time.permute(0, 2, 1)
+                    if self.fusion_time:
+                        xt = self.fusion_time(xt, rof_time, is_2d=False)
+            # --- FUSION BLOCK END ---
 
             x, xt = self.crosstransformer(x, xt)
             # print("Cross Tran X {}, XT: {}".format(x.shape, xt.shape))
