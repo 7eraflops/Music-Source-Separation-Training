@@ -1,4 +1,6 @@
+import gc
 import os
+
 import torch
 import torch.nn.functional as F
 
@@ -27,7 +29,12 @@ class LatentSaver:
         run_name,
     ):
         self.model = model
-        self.model_type = model_type
+        # Handle scnet_xl variant
+        self.model_type_original = model_type
+        if model_type == "scnet_xl":
+            self.model_type = "scnet"
+        else:
+            self.model_type = model_type
         self.latents_path = latents_path
         self.dataset_name = dataset_name
         self.subset_name = subset_name
@@ -35,19 +42,19 @@ class LatentSaver:
         self.run_name = run_name
         self.hooks = []
         self.collected_latents = {}
-        # self.collected_skips = {"skips": {}, "time_skips": {}} # Removed: no longer collecting skips
 
         if self.model_type not in BOTTLENECK_MODULES:
             raise ValueError(
-                f"Model type '{self.model_type}' not supported for latent saving."
+                f"Model type '{self.model_type_original}' not supported for latent saving."
             )
 
     def _get_save_path(self):
         # <run>/<model_type>/<dataset>/<subset>/<track_name>.pt
+        # Use original model_type for path to preserve variant information
         return os.path.join(
             self.latents_path,
             self.run_name,
-            self.model_type,
+            self.model_type_original,
             self.dataset_name,
             self.subset_name,
             f"{self.track_name}.pt",
@@ -63,8 +70,6 @@ class LatentSaver:
             )
         else:
             self.collected_latents[module_name].append(output.clone().detach().cpu())
-
-    # _skip_hook_fn removed: no longer used
 
     def register_hooks(self):
         module_names = BOTTLENECK_MODULES[self.model_type]
@@ -82,97 +87,91 @@ class LatentSaver:
                 self.hooks.append(hook)
                 print(f"Registered hook for {self.model_type}: {name}")
 
-        # Removed: Special handling for htdemucs to capture skip connections
-
     def save_and_remove_hooks(self):
+        """
+        NO-PADDING VERSION FOR TESTING
+        This will fail if tensors have mismatched dimensions!
+        """
         # Special case for htdemucs to save its bottleneck latents into one file
         if self.model_type == "htdemucs":
             if "crosstransformer" not in self.collected_latents:
                 print("Warning: No htdemucs bottleneck latents were collected.")
                 return
-            
+
             # Process bottleneck latents (which are lists of chunks)
             latents = self.collected_latents["crosstransformer"]
             latents_x = [item[0] for item in latents]
             latents_xt = [item[1] for item in latents]
 
-            # Pad tensors to the same length before concatenation
-            if len(latents_x) > 1:
-                max_len_x = max(t.shape[3] for t in latents_x)
-                padded_latents_x = []
-                for t in latents_x:
-                    pad_len = max_len_x - t.shape[3]
-                    if pad_len > 0:
-                        padded_latents_x.append(F.pad(t, (0, pad_len)))
-                    else:
-                        padded_latents_x.append(t)
-                latents_x = padded_latents_x
-
-            if len(latents_xt) > 1:
-                max_len_xt = max(t.shape[2] for t in latents_xt)
-                padded_latents_xt = []
-                for t in latents_xt:
-                    pad_len = max_len_xt - t.shape[2]
-                    if pad_len > 0:
-                        padded_latents_xt.append(F.pad(t, (0, pad_len)))
-                    else:
-                        padded_latents_xt.append(t)
-                latents_xt = padded_latents_xt
+            # NO PADDING - just try to concatenate directly
+            print(f"[NO-PADDING] Attempting to concat {len(latents_x)} freq latents...")
+            print(f"[NO-PADDING] Shapes: {[t.shape for t in latents_x[:3]]} ...")
 
             full_latent_x = torch.cat(latents_x, dim=3)
             full_latent_xt = torch.cat(latents_xt, dim=2)
 
+            # Explicitly delete intermediate tensors to free memory
+            del latents, latents_x, latents_xt
+
             # Combine just the bottleneck latents into a dictionary
             data_to_save = {
-                'freq_latent': full_latent_x,
-                'time_latent': full_latent_xt,
+                "freq_latent": full_latent_x,
+                "time_latent": full_latent_xt,
             }
 
             # Save to a single file
             path = self._get_save_path()
             os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save(data_to_save, path)
-            print(f"Saved htdemucs bottleneck latents to {path}")
+            print(f"[NO-PADDING] Saved htdemucs bottleneck latents to {path}")
+
+            # Explicitly delete saved data to free memory
+            del data_to_save, full_latent_x, full_latent_xt
 
         else:
             # Logic for other models (scnet, bs_roformer)
             for module_name, latents in self.collected_latents.items():
                 if not latents:
                     continue
+
                 # Determine time dimension for concatenation
                 time_dim = 1  # bs_roformer (b, t, f, d)
                 if self.model_type == "scnet":
                     time_dim = 3  # scnet (b, c, fr, t)
-                
-                # Also apply padding for other models just in case
-                if len(latents) > 1:
-                    max_len = max(t.shape[time_dim] for t in latents)
-                    padded_latents = []
-                    for t in latents:
-                        pad_len = max_len - t.shape[time_dim]
-                        if pad_len > 0:
-                            # Create a padding tuple dynamically based on the dimension
-                            # (pad_left, pad_right, pad_top, pad_bottom, ...)
-                            # We only pad the last dimension used for time
-                            pad_tuple = [0] * (2 * len(t.shape))
-                            pad_tuple[2 * (len(t.shape) - 1 - time_dim) + 1] = pad_len
-                            padded_latents.append(F.pad(t, tuple(pad_tuple)))
-                        else:
-                            padded_latents.append(t)
-                    latents = padded_latents
+
+                # NO PADDING - just try to concatenate directly
+                print(
+                    f"[NO-PADDING] Attempting to concat {len(latents)} latents along dim {time_dim}..."
+                )
+                print(f"[NO-PADDING] First 3 shapes: {[t.shape for t in latents[:3]]}")
+                if len(latents) > 3:
+                    print(
+                        f"[NO-PADDING] Last 3 shapes: {[t.shape for t in latents[-3:]]}"
+                    )
 
                 full_latent = torch.cat(latents, dim=time_dim)
-                path = self._get_save_path()
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                torch.save(full_latent, path)
-                print(f"Saved full latent to {path}")
+
+                if full_latent is not None:
+                    path = self._get_save_path()
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    torch.save(full_latent, path)
+                    print(f"[NO-PADDING] Saved full latent to {path}")
+
+                    # Explicitly delete the full latent to free memory
+                    del full_latent
 
         # Cleanup
         for hook in self.hooks:
             hook.remove()
         self.hooks = []
         self.collected_latents = {}
-        print("Removed all hooks.")
+
+        # Force garbage collection and clear CUDA cache if available
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print("[NO-PADDING] Removed all hooks and cleared memory.")
 
 
 def setup_latent_saver(model, args, config, track_path):
@@ -197,16 +196,8 @@ def setup_latent_saver(model, args, config, track_path):
     latents_path = args.save_latents_path
 
     # Infer dataset and subset from input folder structure
-    # Assumes input_folder is something like /path/to/dataset_name/subset_name
-    # Examples:
-    #   - /home/.../inference/moisesdb_musdb18_style_split/train
-    #   - /home/.../datasets/musdb18hq/test
     input_folder = os.path.abspath(args.input_folder)
-
-    # Get the last component of input_folder - this should be the subset (train/test/valid)
     subset_name = os.path.basename(input_folder)
-
-    # Get the second-to-last component - this should be the dataset name
     parent_dir = os.path.dirname(input_folder)
     dataset_name = os.path.basename(parent_dir)
 
@@ -228,9 +219,7 @@ def setup_latent_saver(model, args, config, track_path):
             path_parts = abs_ckpt_path.split(os.sep)
             ckpt_index = path_parts.index("checkpoints")
 
-            # Check if it's in a pattern like: checkpoints/{model_type}/model.ckpt
             if ckpt_index > 0 and path_parts[ckpt_index - 1] not in ["checkpoints"]:
-                # Check for training_X or outputs/session pattern before checkpoints
                 for i in range(ckpt_index - 1, -1, -1):
                     part = path_parts[i]
                     if (
@@ -246,16 +235,14 @@ def setup_latent_saver(model, args, config, track_path):
                             run_name = part
                         break
                 else:
-                    # No training session found, assume original_models
                     run_name = "original_models"
             else:
                 run_name = "original_models"
         else:
-            # Fallback to checkpoint filename
             run_name = os.path.splitext(os.path.basename(args.start_check_point))[0]
 
     print(
-        f"Latent saver setup: run={run_name}, model_type={model_type}, dataset={dataset_name}, subset={subset_name}, track={track_name}"
+        f"[NO-PADDING] Latent saver setup: run={run_name}, model_type={model_type}, dataset={dataset_name}, subset={subset_name}, track={track_name}"
     )
 
     try:

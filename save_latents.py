@@ -1,28 +1,31 @@
-# coding: utf-8
-__author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
-
-import time
-import librosa
-import sys
-import os
+import gc
 import glob
-import torch
-import soundfile as sf
+import os
+import sys
+import time
+
+import librosa
 import numpy as np
-from tqdm.auto import tqdm
+import soundfile as sf
+import torch
 import torch.nn as nn
+from tqdm.auto import tqdm
 
 # Using the embedded version of Python can also correctly import the utils module.
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
-from utils.audio_utils import normalize_audio, denormalize_audio, draw_spectrogram
-from utils.settings import get_model_from_config, parse_args_inference
-from utils.model_utils import demix
-from utils.model_utils import prefer_target_instrument, apply_tta, load_start_checkpoint
-from utils.latent_saver import setup_latent_saver
-
 import warnings
+
+from utils.audio_utils import denormalize_audio, draw_spectrogram, normalize_audio
+from utils.latent_saver import setup_latent_saver
+from utils.model_utils import (
+    apply_tta,
+    demix,
+    load_start_checkpoint,
+    prefer_target_instrument,
+)
+from utils.settings import get_model_from_config, parse_args_inference
 
 warnings.filterwarnings("ignore")
 
@@ -48,15 +51,13 @@ def run_folder(model, args, config, device, verbose: bool = False):
     start_time = time.time()
     model.eval()
 
-    mixture_paths = sorted(glob.glob(os.path.join(args.input_folder, '*.*')))
-    sample_rate = getattr(config.audio, 'sample_rate', 44100)
+    mixture_paths = sorted(glob.glob(os.path.join(args.input_folder, "*.*")))
+    sample_rate = getattr(config.audio, "sample_rate", 44100)
 
     print(f"Total files found: {len(mixture_paths)}. Using sample rate: {sample_rate}")
 
     instruments = prefer_target_instrument(config)[:]
     os.makedirs(args.store_dir, exist_ok=True)
-
-    latents_path = getattr(args, 'latents_path', None)
 
     if not verbose:
         mixture_paths = tqdm(mixture_paths, desc="Total progress")
@@ -71,70 +72,51 @@ def run_folder(model, args, config, device, verbose: bool = False):
         try:
             mix, sr = librosa.load(path, sr=sample_rate, mono=False)
         except Exception as e:
-            print(f'Cannot read track: {format(path)}')
-            print(f'Error message: {str(e)}')
+            print(f"Cannot read track: {format(path)}")
+            print(f"Error message: {str(e)}")
             continue
 
         # If mono audio we must adjust it depending on model
         if len(mix.shape) == 1:
             mix = np.expand_dims(mix, axis=0)
-            if 'num_channels' in config.audio:
-                if config.audio['num_channels'] == 2:
-                    print(f'Convert mono track to stereo...')
+            if "num_channels" in config.audio:
+                if config.audio["num_channels"] == 2:
+                    print(f"Convert mono track to stereo...")
                     mix = np.concatenate([mix, mix], axis=0)
 
         mix_orig = mix.copy()
-        if 'normalize' in config.inference:
-            if config.inference['normalize'] is True:
+        if "normalize" in config.inference:
+            if config.inference["normalize"] is True:
                 mix, norm_params = normalize_audio(mix)
 
-        # Load Latents if available
-        latents = None
-        if latents_path:
-            # Assume latent filename matches the audio filename (without extension)
-            # path: /.../song_name.mp3 -> uuid = song_name
-            uuid = os.path.splitext(os.path.basename(path))[0]
-            
-            # Find UUID.pt in latents_path recursively
-            candidates = glob.glob(os.path.join(latents_path, '**', f'{uuid}.pt'), recursive=True)
-            if candidates:
-                try:
-                    l_path = candidates[0]
-                    loaded = torch.load(l_path, map_location='cpu', weights_only=False)
-                    if isinstance(loaded, torch.Tensor):
-                        latents = {'bs_roformer': loaded}
-                    elif isinstance(loaded, dict):
-                        latents = loaded
-                    print(f"Loaded latents for {uuid}")
-                except Exception as e:
-                    print(f"Failed to load latent for {uuid}: {e}")
-            else:
-                print(f"No latent found for {uuid} in {latents_path}")
-
         latent_saver = setup_latent_saver(model, args, config, path)
-        waveforms_orig = demix(config, model, mix, device, model_type=args.model_type, pbar=detailed_pbar, latents=latents)
+        waveforms_orig = demix(
+            config, model, mix, device, model_type=args.model_type, pbar=detailed_pbar
+        )
         if latent_saver:
             latent_saver.save_and_remove_hooks()
 
         if args.use_tta:
-            waveforms_orig = apply_tta(config, model, mix, waveforms_orig, device, args.model_type)
+            waveforms_orig = apply_tta(
+                config, model, mix, waveforms_orig, device, args.model_type
+            )
 
         if args.extract_instrumental:
-            instr = 'vocals' if 'vocals' in instruments else instruments[0]
-            waveforms_orig['instrumental'] = mix_orig - waveforms_orig[instr]
-            if 'instrumental' not in instruments:
-                instruments.append('instrumental')
+            instr = "vocals" if "vocals" in instruments else instruments[0]
+            waveforms_orig["instrumental"] = mix_orig - waveforms_orig[instr]
+            if "instrumental" not in instruments:
+                instruments.append("instrumental")
 
         file_name = os.path.splitext(os.path.basename(path))[0]
 
         if not args.no_audio_output:
             for instr in instruments:
                 estimates = waveforms_orig[instr]
-                if 'normalize' in config.inference:
-                    if config.inference['normalize'] is True:
+                if "normalize" in config.inference:
+                    if config.inference["normalize"] is True:
                         estimates = denormalize_audio(estimates, norm_params)
 
-                codec = 'flac' if getattr(args, 'flac_file', False) else 'wav'
+                codec = "flac" if getattr(args, "flac_file", False) else "wav"
                 subtype = args.pcm_type
 
                 dirnames, fname = format_filename(
@@ -144,7 +126,7 @@ def run_folder(model, args, config, device, verbose: bool = False):
                     file_name=file_name,
                     dir_name=os.path.dirname(path),
                     model_type=args.model_type,
-                    model=os.path.splitext(os.path.basename(args.start_check_point))[0]
+                    model=os.path.splitext(os.path.basename(args.start_check_point))[0],
                 )
 
                 output_dir = os.path.join(args.store_dir, *dirnames)
@@ -155,22 +137,34 @@ def run_folder(model, args, config, device, verbose: bool = False):
                 print("Wrote file:", output_path)
                 if args.draw_spectro > 0:
                     output_img_path = os.path.join(output_dir, f"{fname}.jpg")
-                    draw_spectrogram(estimates.T, sr, args.draw_spectro, output_img_path)
+                    draw_spectrogram(
+                        estimates.T, sr, args.draw_spectro, output_img_path
+                    )
                     print("Wrote file:", output_img_path)
+
+        # Explicitly clear memory after processing each track
+        del mix, mix_orig, waveforms_orig
+        if latent_saver:
+            del latent_saver
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     print(f"Elapsed time: {time.time() - start_time:.2f} seconds.")
 
+
 def format_filename(template, **kwargs):
-    '''
+    """
     Formats a filename from a template. e.g "{file_name}/{instr}"
     Using slashes ('/') in template will result in directories being created
     Returns [dirnames, fname], i.e. an array of dir names and a single file name
-    '''
+    """
     result = template
     for k, v in kwargs.items():
         result = result.replace(f"{{{k}}}", str(v))
     *dirnames, fname = result.split("/")
     return dirnames, fname
+
 
 def proc_folder(dict_args):
     args = parse_args_inference(dict_args)
@@ -178,8 +172,12 @@ def proc_folder(dict_args):
     if args.force_cpu:
         device = "cpu"
     elif torch.cuda.is_available():
-        print('CUDA is available, use --force_cpu to disable it.')
-        device = f'cuda:{args.device_ids[0]}' if isinstance(args.device_ids, list) else f'cuda:{args.device_ids}'
+        print("CUDA is available, use --force_cpu to disable it.")
+        device = (
+            f"cuda:{args.device_ids[0]}"
+            if isinstance(args.device_ids, list)
+            else f"cuda:{args.device_ids}"
+        )
     elif torch.backends.mps.is_available():
         device = "mps"
 
@@ -191,13 +189,19 @@ def proc_folder(dict_args):
     model, config = get_model_from_config(args.model_type, args.config_path)
 
     if args.start_check_point:
-        checkpoint = torch.load(args.start_check_point, weights_only=False, map_location='cpu')
-        load_start_checkpoint(args, model, checkpoint, type_='inference')
+        checkpoint = torch.load(
+            args.start_check_point, weights_only=False, map_location="cpu"
+        )
+        load_start_checkpoint(args, model, checkpoint, type_="inference")
 
     print("Instruments: {}".format(config.training.instruments))
 
     # in case multiple CUDA GPUs are used and --device_ids arg is passed
-    if isinstance(args.device_ids, list) and len(args.device_ids) > 1 and not args.force_cpu:
+    if (
+        isinstance(args.device_ids, list)
+        and len(args.device_ids) > 1
+        and not args.force_cpu
+    ):
         model = nn.DataParallel(model, device_ids=args.device_ids)
 
     model = model.to(device)

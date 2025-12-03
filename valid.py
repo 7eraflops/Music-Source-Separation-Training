@@ -217,6 +217,7 @@ def process_audio_files(
     instruments = prefer_target_instrument(config)
     use_tta = getattr(args, 'use_tta', False)
     store_dir = getattr(args, 'store_dir', '')
+    latents_path = getattr(args, 'latents_path', None)
 
     # extension is used only for reading GT stems; outputs use FLAC/WAV rule unconditionally
     if 'inference' in config and 'extension' in config['inference']:
@@ -266,7 +267,33 @@ def process_audio_files(
         else:
             norm_params = None
 
-        waveforms_orig = demix(config, model, mix.copy(), device, model_type=args.model_type)
+        # Load Latents if available
+        latents = None
+        if latents_path:
+            # Assume latent filename is same as UUID folder name
+            # path is .../uuid/mixture.wav -> folder is .../uuid
+            uuid = os.path.basename(folder)
+            # Find UUID.pt in latents_path recursively
+            # This might be slow if many files, but robust.
+            # Optimization: Check specific path if structure is known?
+            # The user's structure: .../bs_roformer/moisesdb.../train/UUID.pt
+            # We can try looking for UUID.pt directly in latents_path or subdirs.
+            # Fast check: glob
+            candidates = glob.glob(os.path.join(latents_path, '**', f'{uuid}.pt'), recursive=True)
+            if candidates:
+                try:
+                    l_path = candidates[0]
+                    loaded = torch.load(l_path, map_location='cpu', weights_only=False)
+                    # Support both Tensor and Dict formats
+                    if isinstance(loaded, torch.Tensor):
+                        latents = {'bs_roformer': loaded}
+                    elif isinstance(loaded, dict):
+                        latents = loaded
+                except Exception as e:
+                    if verbose and should_print:
+                        print(f"Failed to load latent for {uuid}: {e}")
+
+        waveforms_orig = demix(config, model, mix.copy(), device, model_type=args.model_type, latents=latents)
 
         if use_tta:
             waveforms_orig = apply_tta(config, model, mix, waveforms_orig, device, args.model_type)

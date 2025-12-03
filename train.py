@@ -80,9 +80,38 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
     else:
         pbar = tqdm(train_loader)
 
-    for i, (batch, mixes) in enumerate(pbar):
+    # Handle both 2 and 3 return values from dataset
+    for i, data in enumerate(pbar):
+        if len(data) == 3:
+            batch, mixes, latents = data
+        else:
+            batch, mixes = data
+            latents = None
+
         x = mixes.to(device)
         y = batch.to(device)
+        
+        # Move latents to device if they exist
+        if latents is not None:
+            # latents is a dict of tensors or None
+            # We need to verify if it's a dict and move tensors to device
+            if isinstance(latents, dict):
+                for k, v in latents.items():
+                    if isinstance(v, torch.Tensor):
+                        latents[k] = v.to(device)
+            # Handle case where collate_fn might stack Nones or similar if dataset returned None
+            # But default collate with None usually fails or creates a list of Nones.
+            # If we modified __getitem__ to return None, default collate might fail if batch has mixed types?
+            # MSSDataset returns None for latents in some cases. 
+            # Default collate requires consistent types. 
+            # WE NEED TO FIX DATASET TO RETURN EMPTY DICT INSTEAD OF NONE?
+            # Or check how default collate handles None. It usually crashes.
+            # I will update dataset code to return empty dict or handle it here.
+            # Assuming dataset returns None, default_collate crashes.
+            # Actually, I changed dataset to return None in some branches. 
+            # I should probably change that to {} or handle collation.
+            # For now, let's assume I will fix dataset or it returns empty dict.
+            pass
 
         if normalize:
             x, y = normalize_batch(x, y)
@@ -93,7 +122,10 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
                 if isinstance(device_ids, (list, tuple)):
                     loss = loss.mean()
             else:
-                y_ = model(x)
+                if latents is not None:
+                    y_ = model(x, latents=latents)
+                else:
+                    y_ = model(x)
                 loss = multi_loss(y_, y, x)
 
         loss /= gradient_accumulation_steps

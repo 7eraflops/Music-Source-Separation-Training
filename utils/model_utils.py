@@ -22,7 +22,8 @@ def demix(
     mix: torch.Tensor,
     device: torch.device,
     model_type: str,
-    pbar: bool = False
+    pbar: bool = False,
+    latents: Optional[Dict[str, torch.Tensor]] = None
 ) -> Union[Dict[str, np.ndarray], np.ndarray]:
     """
     Perform audio source separation with a given model.
@@ -41,6 +42,9 @@ def demix(
             determines processing mode.
         pbar (bool, optional): If True, show a progress bar during chunk
             processing. Defaults to False.
+        latents (Optional[Dict[str, torch.Tensor]]): External latents for fusion models.
+            Keys should match model expectations (e.g., 'bs_roformer').
+            Values should be full-track tensors (e.g. (1, T, F, C)).
 
     Returns:
         Union[Dict[str, np.ndarray], np.ndarray]:
@@ -54,7 +58,7 @@ def demix(
 
     mix = torch.tensor(mix, dtype=torch.float32)
 
-    if model_type == 'htdemucs':
+    if model_type == 'htdemucs' or model_type == 'htdemucs_fusion':
         mode = 'demucs'
     else:
         mode = 'generic'
@@ -84,6 +88,9 @@ def demix(
     batch_size = config.inference.batch_size
 
     use_amp = getattr(config.training, 'use_amp', True)
+    
+    # Latent hop length assumption (BS-Roformer standard)
+    latent_hop = 512
 
     with torch.cuda.amp.autocast(enabled=use_amp):
         with torch.inference_mode():
@@ -94,6 +101,11 @@ def demix(
 
             i = 0
             batch_data = []
+            batch_latents = {} # Will hold lists of latent chunks per key
+            if latents:
+                for k in latents:
+                    batch_latents[k] = []
+                    
             batch_locations = []
             if pbar and should_print:
                 progress_bar = tqdm(
@@ -113,13 +125,69 @@ def demix(
                 part = nn.functional.pad(part, (0, chunk_size - chunk_len), mode=pad_mode, value=0)
 
                 batch_data.append(part)
+                
+                # Handle Latents Slicing
+                if latents:
+                    start_frame = i // latent_hop
+                    end_frame = (i + chunk_size) // latent_hop
+                    for k, v in latents.items():
+                        # v is (1, T, F, C) or similar
+                        # Assume Dim 1 is Time
+                        if v.ndim >= 2:
+                            # Check bounds
+                            max_t = v.shape[1]
+                            start_f = min(start_frame, max_t)
+                            end_f = min(end_frame, max_t)
+                            
+                            slice_ = v[:, start_f:end_f].to(device)
+                            
+                            # Pad if necessary (if end_frame > max_t)
+                            expected_frames = (chunk_size) // latent_hop
+                            # Note: Integer division might cause small off-by-one if chunk_size not multiple of 512
+                            # But usually it is.
+                            
+                            current_frames = slice_.shape[1]
+                            if current_frames < expected_frames:
+                                # Pad time dimension (dim 1)
+                                pad_amt = expected_frames - current_frames
+                                # Pad format for F.pad is (last_dim_left, last_dim_right, ...)
+                                # For (1, T, F, C), T is dim 1.
+                                # F.pad traverses from last dim.
+                                # (0,0) -> C
+                                # (0,0) -> F
+                                # (0, pad_amt) -> T
+                                slice_ = nn.functional.pad(slice_, (0, 0, 0, 0, 0, pad_amt))
+                            
+                            batch_latents[k].append(slice_)
+
                 batch_locations.append((i, chunk_len))
                 i += step
 
                 # Process batch if it's full or the end is reached
                 if len(batch_data) >= batch_size or i >= mix.shape[1]:
                     arr = torch.stack(batch_data, dim=0)
-                    x = model(arr)
+                    
+                    # Prepare batched latents
+                    current_latents = None
+                    if latents:
+                        current_latents = {}
+                        for k in batch_latents:
+                            # Stack along batch dimension (dim 0)
+                            # each element in list is (1, T, F, C)
+                            # stack -> (B, 1, T, F, C) -> squeeze dim 1 -> (B, T, F, C)
+                            stacked = torch.stack(batch_latents[k], dim=0)
+                            if stacked.shape[1] == 1:
+                                stacked = stacked.squeeze(1)
+                            current_latents[k] = stacked
+                        
+                        # Clear batch buffer
+                        for k in batch_latents:
+                            batch_latents[k] = []
+
+                    if current_latents:
+                        x = model(arr, latents=current_latents)
+                    else:
+                        x = model(arr)
 
                     if mode == "generic":
                         window = windowing_array.clone() # using clone() fixes the clicks at chunk edges when using batch_size=1

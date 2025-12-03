@@ -54,6 +54,7 @@ def prepare_data(config: Union[ConfigDict, OmegaConf], args: argparse.Namespace,
             batch_size=ddp_batch,
             metadata_path=os.path.join(args.results_path, f"metadata_{args.dataset_type}.pkl"),
             dataset_type=args.dataset_type,
+            latents_path=getattr(args, 'latents_path', None)
         )
 
         sampler = DistributedSampler(
@@ -80,6 +81,7 @@ def prepare_data(config: Union[ConfigDict, OmegaConf], args: argparse.Namespace,
             batch_size=batch_size,
             metadata_path=os.path.join(args.results_path, f"metadata_{args.dataset_type}.pkl"),
             dataset_type=args.dataset_type,
+            latents_path=getattr(args, 'latents_path', None)
         )
 
         train_loader = DataLoader(
@@ -178,7 +180,7 @@ def process_chunk_worker(args):
 
 
 class MSSDataset(torch.utils.data.Dataset):
-    def __init__(self, config, data_path, metadata_path="metadata.pkl", dataset_type=1, batch_size=None, verbose=True):
+    def __init__(self, config, data_path, metadata_path="metadata.pkl", dataset_type=1, batch_size=None, verbose=True, latents_path=None):
         self.verbose = verbose
         self.config = config
         self.dataset_type = dataset_type  # 1, 2, 3, 4 or 5
@@ -189,6 +191,21 @@ class MSSDataset(torch.utils.data.Dataset):
         self.batch_size = batch_size
         self.file_types = ['wav', 'flac']
         self.metadata_path = metadata_path
+        self.latents_path = latents_path
+        
+        # Latent configuration
+        self.latent_hop_length = 512 # Standard for BS-Roformer
+        self.latent_map = {}
+        if self.latents_path:
+            if self.verbose and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"Scanning latents in {self.latents_path}...")
+            latent_files = glob(os.path.join(self.latents_path, '**', '*.pt'), recursive=True)
+            for lf in latent_files:
+                # Assuming latent file name is UUID.pt
+                name = os.path.splitext(os.path.basename(lf))[0]
+                self.latent_map[name] = lf
+            if self.verbose and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"Found {len(self.latent_map)} latent files.")
 
         should_print = (not dist.is_initialized() or dist.get_rank() == 0)
 
@@ -230,19 +247,81 @@ class MSSDataset(torch.utils.data.Dataset):
             return len(self.chunks_metadata)
         return self.config.training.num_steps * self.batch_size
 
+    def _load_latent_chunk(self, track_path, offset, chunk_size):
+        if not self.latents_path:
+            return None
+            
+        # track_path is like /path/to/uuid_folder
+        uuid = os.path.basename(track_path)
+        if uuid not in self.latent_map:
+            return None
+            
+        latent_file = self.latent_map[uuid]
+        
+        try:
+            # Load the whole latent tensor. Optimizing this would require different storage format.
+            # The files are likely on CPU.
+            # Use weights_only=False because these are raw tensors/dicts, not state_dicts.
+            # Attempt to use map_location='cpu'
+            latents = torch.load(latent_file, map_location='cpu', weights_only=False)
+            
+            res_latents = {}
+            
+            # Handle BS-Roformer Latents
+            if isinstance(latents, torch.Tensor): # (1, T, F, C) or similar
+                # Based on analysis: (1, T, F, C) e.g. (1, 52848, 62, 384)
+                # We need to slice T dimension.
+                
+                # Calculate frames
+                start_frame = offset // self.latent_hop_length
+                num_frames = chunk_size // self.latent_hop_length
+                end_frame = start_frame + num_frames
+                
+                # Slice: latents is (1, T, F, C)
+                # Check dimensions
+                if latents.ndim == 4:
+                    # Check if T is dim 1
+                    T_dim = latents.shape[1]
+                    if end_frame > T_dim:
+                        # Pad if needed or just clip?
+                        # Clipping might be safer, model interpolates anyway
+                        end_frame = min(end_frame, T_dim)
+                        
+                    sliced = latents[:, start_frame:end_frame, :, :]
+                    res_latents['bs_roformer'] = sliced
+            
+            # Handle Dictionary Latents (HTDemucs, SCNet)
+            elif isinstance(latents, dict):
+                # Logic for other models if needed later
+                pass
+                
+            return res_latents
+            
+        except Exception as e:
+            # if (not dist.is_initialized() or dist.get_rank() == 0):
+            #     print(f"Error loading latent {latent_file}: {e}")
+            return None
 
     def __getitem__(self, index):
+        latents = {}
         if self.dataset_type == 5:
             track_path, offset = self.chunks_metadata[index]
             res = self._load_chunk_by_offset(track_path, offset)
+            latents = self._load_latent_chunk(track_path, offset, self.chunk_size)
         elif self.dataset_type in [1, 2, 3]:
             res = self.load_random_mix()
+            # load_random_mix mixes multiple tracks, so we can't easily get a single latent.
+            # Fusion training typically requires aligned data (dataset_type 4 or 5).
+            # If dataset_type is 1, we might just return None latents or warn.
+            # For now, returning empty latents.
+            latents = None
         else:  # type 4
             if self.do_chunks:
                 track_path, offset = self.chunks_metadata[np.random.randint(len(self.chunks_metadata))]
                 res = self._load_chunk_by_offset(track_path, offset)
+                latents = self._load_latent_chunk(track_path, offset, self.chunk_size)
             else:
-                res = self.load_aligned_data()
+                res, latents = self.load_aligned_data()
 
         # Randomly change loudness of each stem
         if self.aug:
@@ -277,9 +356,9 @@ class MSSDataset(torch.utils.data.Dataset):
         # If we need to optimize only given stem
         if self.config.training.target_instrument is not None:
             index = self.config.training.instruments.index(self.config.training.target_instrument)
-            return res[index:index+1], mix
+            return res[index:index+1], mix, latents
 
-        return res, mix
+        return res, mix, latents
 
 
     def _initialize_chunks_metadata(self):
@@ -770,7 +849,9 @@ class MSSDataset(torch.utils.data.Dataset):
         if self.aug:
             for i, instr in enumerate(self.instruments):
                 res[i] = self.augm_data(res[i], instr)
-        return torch.tensor(res, dtype=torch.float32)
+        
+        latents = self._load_latent_chunk(track_path, common_offset if common_offset else 0, self.chunk_size)
+        return torch.tensor(res, dtype=torch.float32), latents
 
 
     def augm_data(self, source, instr):
