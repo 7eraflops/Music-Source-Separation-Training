@@ -103,6 +103,11 @@ def parse_args_train(
         help="validation data paths. You can provide several folders.",
     )
     parser.add_argument(
+        "--latents_path",
+        type=str,
+        help="Path to folder containing external latents for fusion models.",
+    )
+    parser.add_argument(
         "--num_workers", type=int, default=0, help="dataloader num_workers"
     )
     parser.add_argument(
@@ -291,6 +296,11 @@ def parse_args_valid(dict_args: Union[Dict, None]) -> argparse.Namespace:
     )
     parser.add_argument("--valid_path", nargs="+", type=str, help="Validate path")
     parser.add_argument(
+        "--latents_path",
+        type=str,
+        help="Path to folder containing external latents for fusion models.",
+    )
+    parser.add_argument(
         "--store_dir", type=str, default="", help="Path to store results as wav file"
     )
     parser.add_argument(
@@ -460,6 +470,12 @@ def parse_args_inference(dict_args: Union[Dict, None]) -> argparse.Namespace:
         "--save_latents_path", type=str, default="", help="path to store latent files"
     )
     parser.add_argument(
+        "--latents_path",
+        type=str,
+        default="",
+        help="Path to folder containing external latents for fusion models.",
+    )
+    parser.add_argument(
         "--no_audio_output", action="store_true", help="Do not save output audio files"
     )
     if dict_args is not None:
@@ -494,8 +510,7 @@ def load_config(model_type: str, config_path: str) -> Union[ConfigDict, OmegaCon
     or a YAML-parsed ConfigDict for other models.
 
     Args:
-        model_type (str): Model identifier that determines the loader behavior
-            (e.g., 'htdemucs', 'mdx23c', etc.).
+        model_type (str): Identifier of the model family (e.g., 'htdemucs', 'mdx23c', etc.).
         config_path (str): Path to the configuration file (YAML/OmegaConf).
 
     Returns:
@@ -507,7 +522,7 @@ def load_config(model_type: str, config_path: str) -> Union[ConfigDict, OmegaCon
     """
     try:
         with open(config_path, "r") as f:
-            if model_type == "htdemucs":
+            if model_type == "htdemucs" or model_type == "htdemucs_fusion":
                 config = OmegaConf.load(config_path)
             else:
                 config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
@@ -551,6 +566,10 @@ def get_model_from_config(
         model = TFC_TDF_net(config)
     elif model_type == "htdemucs":
         from models.demucs4ht import get_model
+
+        model = get_model(config)
+    elif model_type == "htdemucs_fusion":
+        from models.demucs4ht_fusion import get_model
 
         model = get_model(config)
     elif model_type == "segm_models":
