@@ -249,21 +249,19 @@ class MSSDataset(torch.utils.data.Dataset):
 
     def _load_latent_chunk(self, track_path, offset, chunk_size):
         if not self.latents_path:
-            return None
+            return {}
             
         # track_path is like /path/to/uuid_folder
         uuid = os.path.basename(track_path)
         if uuid not in self.latent_map:
-            return None
+            return {}
             
         latent_file = self.latent_map[uuid]
         
         try:
-            # Load the whole latent tensor. Optimizing this would require different storage format.
-            # The files are likely on CPU.
-            # Use weights_only=False because these are raw tensors/dicts, not state_dicts.
-            # Attempt to use map_location='cpu'
-            latents = torch.load(latent_file, map_location='cpu', weights_only=False)
+            # Load with mmap=True to avoid loading the entire file into RAM.
+            # This is crucial for large latent files (3-4GB).
+            latents = torch.load(latent_file, map_location='cpu', weights_only=False, mmap=True)
             
             res_latents = {}
             
@@ -286,8 +284,12 @@ class MSSDataset(torch.utils.data.Dataset):
                         # Pad if needed or just clip?
                         # Clipping might be safer, model interpolates anyway
                         end_frame = min(end_frame, T_dim)
-                        
-                    sliced = latents[:, start_frame:end_frame, :, :]
+                    
+                    # With mmap, this slice operation reads only the required data from disk.
+                    # clone() ensures we copy the data to memory and release the mmap reference if needed,
+                    # although keeping it mmapped is also fine for short lived scope.
+                    # copying to regular tensor is safer for collation.
+                    sliced = latents[:, start_frame:end_frame, :, :].clone()
                     res_latents['bs_roformer'] = sliced
             
             # Handle Dictionary Latents (HTDemucs, SCNet)
@@ -300,7 +302,7 @@ class MSSDataset(torch.utils.data.Dataset):
         except Exception as e:
             # if (not dist.is_initialized() or dist.get_rank() == 0):
             #     print(f"Error loading latent {latent_file}: {e}")
-            return None
+            return {}
 
     def __getitem__(self, index):
         latents = {}
@@ -314,7 +316,7 @@ class MSSDataset(torch.utils.data.Dataset):
             # Fusion training typically requires aligned data (dataset_type 4 or 5).
             # If dataset_type is 1, we might just return None latents or warn.
             # For now, returning empty latents.
-            latents = None
+            latents = {}
         else:  # type 4
             if self.do_chunks:
                 track_path, offset = self.chunks_metadata[np.random.randint(len(self.chunks_metadata))]

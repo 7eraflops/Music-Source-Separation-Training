@@ -691,6 +691,10 @@ class FusionHTDemucs(nn.Module):
             if 'bs_roformer' in latents:
                 rof = latents['bs_roformer'] # (B, T, F, C)
                 
+                # Handle case where DataLoader collates (1, T, F, C) into (B, 1, T, F, C)
+                if rof.dim() == 5 and rof.shape[1] == 1:
+                    rof = rof.squeeze(1)
+                
                 # Prepare for Freq Fusion: (B, C, F, T)
                 # Permute -> (B, C, F, T)
                 rof_freq = rof.permute(0, 3, 2, 1)
