@@ -1,28 +1,29 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import json
+import math
+from fractions import Fraction
 from functools import partial
 
 import numpy as np
 import torch
-import json
+import torch.nn as nn
+import torch.nn.functional as F
+from demucs.demucs import Demucs, rescale_module
+from demucs.hdemucs import (
+    HDecLayer,
+    HDemucs,
+    HEncLayer,
+    MultiWrap,
+    ScaledEmbedding,
+    pad1d,
+)
+from demucs.spec import ispectro, spectro
+from demucs.states import capture_init
+from demucs.transformer import CrossTransformerEncoder
+from einops import rearrange
 from omegaconf import OmegaConf
-from demucs.demucs import Demucs
-from demucs.hdemucs import HDemucs
-
-import math
 from openunmix.filtering import wiener
 from torch import nn
 from torch.nn import functional as F
-from fractions import Fraction
-from einops import rearrange
-
-from demucs.transformer import CrossTransformerEncoder
-
-from demucs.demucs import rescale_module
-from demucs.states import capture_init
-from demucs.spec import spectro, ispectro
-from demucs.hdemucs import pad1d, ScaledEmbedding, HEncLayer, MultiWrap, HDecLayer
 
 
 class LatentCrossAttention(nn.Module):
@@ -30,11 +31,17 @@ class LatentCrossAttention(nn.Module):
     Simple Cross-Attention module to fuse external latents.
     Handles channel projection and spatial interpolation.
     """
+
     def __init__(self, model_channels, latent_channels, num_heads=8, dropout=0.1):
         super().__init__()
         self.norm = nn.LayerNorm(model_channels)
         self.proj = nn.Conv1d(latent_channels, model_channels, 1)
-        self.attn = nn.MultiheadAttention(embed_dim=model_channels, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=model_channels,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, latents, is_2d=False):
@@ -43,54 +50,58 @@ class LatentCrossAttention(nn.Module):
         latents: (B, Latent_C, Latent_F, Latent_T) if is_2d else (B, Latent_C, Latent_T)
         """
         B, C = x.shape[:2]
-        
+
         # 1. Align Channels: Project Latent C -> Model C
         # We treat 2D (Freq, Time) as a flattened sequence of channels for Conv1d if needed,
         # or just use Conv1d on flattened data.
         # Actually, if is_2d, latents is (B, C_lat, F_lat, T_lat).
         # We want to project channels.
-        
+
         if is_2d:
             # latents: (B, C_lat, F, T)
             l_b, l_c, l_f, l_t = latents.shape
-            latents_proj = F.interpolate(latents, size=x.shape[2:], mode='bilinear', align_corners=False)
+            latents_proj = F.interpolate(
+                latents, size=x.shape[2:], mode="bilinear", align_corners=False
+            )
             # Now (B, C_lat, F_model, T_model). We need C_model.
             # Reshape to apply 1x1 conv over spatial dims
-            latents_proj = latents_proj.view(l_b, l_c, -1) # (B, C_lat, F*T)
-            latents_proj = self.proj(latents_proj) # (B, C, F*T)
-            
+            latents_proj = latents_proj.view(l_b, l_c, -1)  # (B, C_lat, F*T)
+            latents_proj = self.proj(latents_proj)  # (B, C, F*T)
+
             # Flatten Query
-            x_flat = x.view(B, C, -1).permute(0, 2, 1) # (B, F*T, C)
-            
+            x_flat = x.view(B, C, -1).permute(0, 2, 1)  # (B, F*T, C)
+
             # Prepare Key/Value
-            kv = latents_proj.permute(0, 2, 1) # (B, F*T, C)
-            
+            kv = latents_proj.permute(0, 2, 1)  # (B, F*T, C)
+
             # Attention
             # Q=x, K=latents, V=latents
             out, _ = self.attn(query=self.norm(x_flat), key=kv, value=kv)
-            
+
             # Residual + Reshape
             x_out = x_flat + self.dropout(out)
             x_out = x_out.permute(0, 2, 1).view(B, C, x.shape[2], x.shape[3])
             return x_out
-            
+
         else:
             # latents: (B, C_lat, T_lat)
             # Interpolate Time
-            latents_proj = F.interpolate(latents, size=x.shape[-1], mode='linear', align_corners=False)
-            
+            latents_proj = F.interpolate(
+                latents, size=x.shape[-1], mode="linear", align_corners=False
+            )
+
             # Project Channels
-            latents_proj = self.proj(latents_proj) # (B, C, T)
-            
+            latents_proj = self.proj(latents_proj)  # (B, C, T)
+
             # Prepare Query
-            x_perm = x.permute(0, 2, 1) # (B, T, C)
-            
+            x_perm = x.permute(0, 2, 1)  # (B, T, C)
+
             # Prepare Key/Value
-            kv = latents_proj.permute(0, 2, 1) # (B, T, C)
-            
+            kv = latents_proj.permute(0, 2, 1)  # (B, T, C)
+
             # Attention
             out, _ = self.attn(query=self.norm(x_perm), key=kv, value=kv)
-            
+
             # Residual
             x_out = x_perm + self.dropout(out)
             return x_out.permute(0, 2, 1)
@@ -183,6 +194,7 @@ class FusionHTDemucs(nn.Module):
         # FUSION ARGS
         use_latents=False,
         latent_channels=384,
+        freeze_encoder=False,
     ):
         """
         Args:
@@ -274,6 +286,7 @@ class FusionHTDemucs(nn.Module):
                 training is used during inference.
             use_latents: (bool) Whether to use external latents for fusion.
             latent_channels: (int) Number of channels in the external latent (e.g. 384 for Roformer).
+            freeze_encoder: (bool) if True, freezes all encoder parameters (freq and time branches).
         """
         super().__init__()
         self.num_subbands = num_subbands
@@ -297,6 +310,7 @@ class FusionHTDemucs(nn.Module):
         self.freq_emb = None
         self.use_latents = use_latents
         self.latent_channels = latent_channels
+        self.freeze_encoder = freeze_encoder
         assert wiener_iters == end_iters
 
         self.encoder = nn.ModuleList()
@@ -372,7 +386,7 @@ class FusionHTDemucs(nn.Module):
                     dconv=dconv_mode & 1,
                     context=context_enc,
                     empty=last_freq,
-                    **kwt
+                    **kwt,
                 )
                 self.tencoder.append(tenc)
 
@@ -392,7 +406,7 @@ class FusionHTDemucs(nn.Module):
                 dconv=dconv_mode & 2,
                 last=index == 0,
                 context=context,
-                **kw_dec
+                **kw_dec,
             )
             if multi:
                 dec = MultiWrap(dec, multi_freqs)
@@ -404,7 +418,7 @@ class FusionHTDemucs(nn.Module):
                     empty=last_freq,
                     last=index == 0,
                     context=context,
-                    **kwt
+                    **kwt,
                 )
                 self.tdecoder.insert(0, tdec)
             self.decoder.insert(0, dec)
@@ -447,9 +461,12 @@ class FusionHTDemucs(nn.Module):
         self.fusion_time = None
         if self.use_latents:
             # We assume transformer_channels is the dimension at the bottleneck
-            self.fusion_freq = LatentCrossAttention(transformer_channels, latent_channels)
-            self.fusion_time = LatentCrossAttention(transformer_channels, latent_channels)
-
+            self.fusion_freq = LatentCrossAttention(
+                transformer_channels, latent_channels
+            )
+            self.fusion_time = LatentCrossAttention(
+                transformer_channels, latent_channels
+            )
 
         if t_layers > 0:
             self.crosstransformer = CrossTransformerEncoder(
@@ -488,6 +505,16 @@ class FusionHTDemucs(nn.Module):
         else:
             self.crosstransformer = None
 
+        # Freeze encoder layers if requested
+        if freeze_encoder:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+            for param in self.tencoder.parameters():
+                param.requires_grad = False
+            if self.freq_emb is not None:
+                for param in self.freq_emb.parameters():
+                    param.requires_grad = False
+
     def _spec(self, x):
         hl = self.hop_length
         nfft = self.nfft
@@ -507,7 +534,7 @@ class FusionHTDemucs(nn.Module):
 
         z = spectro(x, nfft, hl)[..., :-1, :]
         assert z.shape[-1] == le + 4, (z.shape, x.shape, le)
-        z = z[..., 2: 2 + le]
+        z = z[..., 2 : 2 + le]
         return z
 
     def _ispec(self, z, length=None, scale=0):
@@ -517,7 +544,7 @@ class FusionHTDemucs(nn.Module):
         pad = hl // 2 * 3
         le = hl * int(math.ceil(length / hl)) + 2 * pad
         x = ispectro(z, hl, length=le)
-        x = x[..., pad: pad + length]
+        x = x[..., pad : pad + length]
         return x
 
     def _magnitude(self, z):
@@ -591,8 +618,9 @@ class FusionHTDemucs(nn.Module):
         training_length = int(self.segment * self.samplerate)
         if training_length < length:
             raise ValueError(
-                    f"Given length {length} is longer than "
-                    f"training length {training_length}")
+                f"Given length {length} is longer than "
+                f"training length {training_length}"
+            )
         return training_length
 
     def cac2cws(self, x):
@@ -680,7 +708,7 @@ class FusionHTDemucs(nn.Module):
                 x = x + self.freq_emb_scale * emb
 
             saved.append(x)
-        
+
         if self.crosstransformer:
             if self.bottom_channels:
                 b, c, f, t = x.shape
@@ -695,20 +723,20 @@ class FusionHTDemucs(nn.Module):
                 # Latent Shape Check based on analysis:
                 # BS-Roformer: (B, T, F, C) e.g., (1, 52848, 62, 384)
                 # We need to permute to (B, C, F, T) or (B, C, T)
-                
-                if 'bs_roformer' in latents:
-                    rof = latents['bs_roformer'] # (B, T, F, C)
-                    
+
+                if "bs_roformer" in latents:
+                    rof = latents["bs_roformer"]  # (B, T, F, C)
+
                     # Handle case where DataLoader collates (1, T, F, C) into (B, 1, T, F, C)
                     if rof.dim() == 5 and rof.shape[1] == 1:
                         rof = rof.squeeze(1)
-                    
+
                     # Prepare for Freq Fusion: (B, C, F, T)
                     # Permute -> (B, C, F, T)
                     rof_freq = rof.permute(0, 3, 2, 1)
                     if self.fusion_freq:
                         x = self.fusion_freq(x, rof_freq, is_2d=True)
-                        
+
                     # Prepare for Time Fusion: (B, C, T)
                     # Aggregate Freq dim (mean) -> (B, T, C)
                     rof_time = rof.mean(dim=2)
@@ -789,14 +817,14 @@ class FusionHTDemucs(nn.Module):
 
 def get_model(args):
     extra = {
-        'sources': list(args.training.instruments),
-        'audio_channels': args.training.channels,
-        'samplerate': args.training.samplerate,
+        "sources": list(args.training.instruments),
+        "audio_channels": args.training.channels,
+        "samplerate": args.training.samplerate,
         # 'segment': args.model_segment or 4 * args.dset.segment,
-        'segment': args.training.segment,
+        "segment": args.training.segment,
     }
-    
-    if args.model == 'htdemucs_fusion':
+
+    if args.model == "htdemucs_fusion":
         klass = FusionHTDemucs
         # We need to pass specific fusion args if they are in args
         # Assuming they will be added to config/args under 'htdemucs_fusion' or similar
@@ -804,13 +832,11 @@ def get_model(args):
         kw = OmegaConf.to_container(getattr(args, args.model), resolve=True)
     else:
         klass = {
-            'demucs': Demucs,
-            'hdemucs': HDemucs,
-            'htdemucs': HTDemucs,
+            "demucs": Demucs,
+            "hdemucs": HDemucs,
+            "htdemucs": HTDemucs,
         }[args.model]
         kw = OmegaConf.to_container(getattr(args, args.model), resolve=True)
-        
+
     model = klass(**extra, **kw)
     return model
-
-
