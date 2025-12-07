@@ -228,11 +228,19 @@ class MSSDataset(torch.utils.data.Dataset):
                 # Map: uuid -> {'source_name': path, ...}
                 if name not in self.latent_map:
                     self.latent_map[name] = {}
-                # Detect source from parent directory name
-                parent_dir = os.path.basename(os.path.dirname(lf))
-                if parent_dir in ["bs_roformer", "scnet_xl", "scnet", "htdemucs"]:
+
+                # Detect source by searching up the directory tree
+                # Handle nested structures like: original_models/bs_roformer/dataset/train/uuid.pt
+                source_name = None
+                path_parts = os.path.normpath(lf).split(os.sep)
+                for part in path_parts:
+                    if part in ["bs_roformer", "scnet_xl", "scnet", "htdemucs"]:
+                        source_name = part
+                        break
+
+                if source_name:
                     if isinstance(self.latent_map[name], dict):
-                        self.latent_map[name][parent_dir] = lf
+                        self.latent_map[name][source_name] = lf
                     else:
                         # Legacy support: if it was a single path, convert to dict
                         old_path = self.latent_map[name]

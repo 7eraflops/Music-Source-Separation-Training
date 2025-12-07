@@ -32,7 +32,10 @@ def check_latent_directory(latents_path):
     sources = {}
     for subdir in subdirs:
         if subdir in ["bs_roformer", "scnet_xl", "scnet", "htdemucs"]:
-            latent_files = glob(os.path.join(latents_path, subdir, "*.pt"))
+            # Search recursively to handle nested structures
+            latent_files = glob(
+                os.path.join(latents_path, subdir, "**", "*.pt"), recursive=True
+            )
             sources[subdir] = len(latent_files)
             print(f"  {subdir}: {len(latent_files)} files")
 
