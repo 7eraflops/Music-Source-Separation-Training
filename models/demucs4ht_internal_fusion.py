@@ -12,6 +12,7 @@ from demucs.hdemucs import pad1d
 from demucs.spec import ispectro, spectro
 from einops import rearrange
 from openunmix.filtering import wiener
+from torch.utils.checkpoint import checkpoint
 
 from models.demucs4ht import (
     HDecLayer,
@@ -313,6 +314,7 @@ class CrossTransformerEncoderWithLatents(nn.Module):
         auto_sparsity,
         num_latent_blocks=2,
         latent_sources=["bs_roformer", "scnet_xl"],
+        use_gradient_checkpointing=False,
     ):
         """
         Args:
@@ -326,6 +328,7 @@ class CrossTransformerEncoderWithLatents(nn.Module):
 
         self.dim = dim
         self.num_latent_blocks = num_latent_blocks
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Original cross-domain transformer (freq <-> time)
         # We'll use this for the freq-time cross-attention blocks
@@ -434,11 +437,27 @@ class CrossTransformerEncoderWithLatents(nn.Module):
             for self_attn, cross_attn in zip(
                 self.latent_self_attn_layers, self.latent_cross_attn_layers
             ):
-                # Self-attention on freq branch
-                x_flat = self_attn(x_flat)
-
-                # Cross-attention: freq <-> external latents with attention mask
-                x_flat = cross_attn(x_flat, latents_proj, key_padding_mask=latent_mask)
+                if (
+                    self.training
+                    and hasattr(self, "use_gradient_checkpointing")
+                    and self.use_gradient_checkpointing
+                ):
+                    # Use gradient checkpointing to save memory during training
+                    x_flat = checkpoint(self_attn, x_flat, use_reentrant=False)
+                    x_flat = checkpoint(
+                        cross_attn,
+                        x_flat,
+                        latents_proj,
+                        latent_mask,
+                        use_reentrant=False,
+                    )
+                else:
+                    # Self-attention on freq branch
+                    x_flat = self_attn(x_flat)
+                    # Cross-attention: freq <-> external latents with attention mask
+                    x_flat = cross_attn(
+                        x_flat, latents_proj, key_padding_mask=latent_mask
+                    )
 
             # Reshape back to (B, C, Fr, T)
             x = rearrange(x_flat, "b c (f t) -> b c f t", f=Fr)
@@ -541,6 +560,7 @@ class InternalFusionHTDemucs(nn.Module):
         freeze_encoder=False,
         latent_sources=["bs_roformer", "scnet_xl"],
         num_latent_blocks=2,
+        use_gradient_checkpointing=False,
     ):
         """
         Args:
@@ -758,6 +778,7 @@ class InternalFusionHTDemucs(nn.Module):
                     auto_sparsity=t_auto_sparsity,
                     num_latent_blocks=num_latent_blocks,
                     latent_sources=latent_sources,
+                    use_gradient_checkpointing=use_gradient_checkpointing,
                 )
 
                 # Latent preprocessor
