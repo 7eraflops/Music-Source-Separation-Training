@@ -572,6 +572,10 @@ def get_model_from_config(
         from models.demucs4ht_fusion import get_model
 
         model = get_model(config)
+    elif model_type == "htdemucs_internal_fusion":
+        from models.demucs4ht_internal_fusion import get_model
+
+        model = get_model(config)
     elif model_type == "segm_models":
         from models.segm_models import Segm_Models_Net
 
