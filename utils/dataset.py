@@ -258,8 +258,13 @@ class MSSDataset(torch.utils.data.Dataset):
                     if isinstance(paths, dict):
                         for source in paths.keys():
                             source_counts[source] = source_counts.get(source, 0) + 1
+                    else:
+                        # Legacy single-source format
+                        source_counts["unknown"] = source_counts.get("unknown", 0) + 1
                 if source_counts:
-                    print(f"Latent sources: {source_counts}")
+                    print(f"Latent sources found: {source_counts}")
+                else:
+                    print("Warning: No latent sources detected!")
 
         should_print = not dist.is_initialized() or dist.get_rank() == 0
 
@@ -333,31 +338,31 @@ class MSSDataset(torch.utils.data.Dataset):
                     latent_file, map_location="cpu", weights_only=False, mmap=True
                 )
 
-                # Handle BS-Roformer Latents (Tensor format)
-                if isinstance(latents, torch.Tensor):  # (1, T, F, C) or similar
-                    # Based on analysis: (1, T, F, C) e.g. (1, 52848, 62, 384)
-                    # We need to slice T dimension.
-
+                # Handle Tensor format latents
+                if isinstance(latents, torch.Tensor):
                     # Calculate frames
                     start_frame = offset // self.latent_hop_length
                     num_frames = chunk_size // self.latent_hop_length
                     end_frame = start_frame + num_frames
 
-                    # Slice: latents is (1, T, F, C)
-                    # Check dimensions
                     if latents.ndim == 4:
-                        # Check if T is dim 1
-                        T_dim = latents.shape[1]
-                        if end_frame > T_dim:
-                            # Pad if needed or just clip?
-                            # Clipping might be safer, model interpolates anyway
-                            end_frame = min(end_frame, T_dim)
+                        # Detect format by checking dimensions
+                        # BS-Roformer: (1, T, F, C) e.g. (1, 52848, 62, 384)
+                        # SCNet-XL: (1, C, F, T) e.g. (1, 256, 88, 46172)
 
-                        # With mmap, this slice operation reads only the required data from disk.
-                        # clone() ensures we copy the data to memory and release the mmap reference if needed,
-                        # although keeping it mmapped is also fine for short lived scope.
-                        # copying to regular tensor is safer for collation.
-                        sliced = latents[:, start_frame:end_frame, :, :].clone()
+                        # Heuristic: if shape[1] > shape[3], likely (1, T, F, C)
+                        # otherwise (1, C, F, T)
+                        if latents.shape[1] > latents.shape[3]:
+                            # BS-Roformer format: (1, T, F, C)
+                            T_dim = latents.shape[1]
+                            end_frame = min(end_frame, T_dim)
+                            sliced = latents[:, start_frame:end_frame, :, :].clone()
+                        else:
+                            # SCNet-XL format: (1, C, F, T)
+                            T_dim = latents.shape[3]
+                            end_frame = min(end_frame, T_dim)
+                            sliced = latents[:, :, :, start_frame:end_frame].clone()
+
                         res_latents[source_name] = sliced
 
                 # Handle Dictionary Latents (HTDemucs, SCNet)
