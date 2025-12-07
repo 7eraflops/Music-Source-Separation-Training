@@ -1,7 +1,3 @@
-# coding: utf-8
-__author__ = "Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/"
-__version__ = "1.0.0"
-
 import math
 from fractions import Fraction
 
