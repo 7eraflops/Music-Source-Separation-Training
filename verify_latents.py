@@ -111,7 +111,8 @@ def main():
     all_ok = True
     for source_name, count in sources.items():
         source_dir = os.path.join(latents_path, source_name)
-        latent_files = glob(os.path.join(source_dir, "*.pt"))
+        # Use recursive glob to handle nested structures
+        latent_files = glob(os.path.join(source_dir, "**", "*.pt"), recursive=True)
 
         if latent_files:
             # Test first file
