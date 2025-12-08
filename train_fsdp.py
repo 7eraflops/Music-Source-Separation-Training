@@ -65,23 +65,24 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
     )
 
     # Configure mixed precision
-    # Use BF16 if available, otherwise FP16
+    # Use FP32 for parameters to avoid cuFFT BFloat16 incompatibility with STFT
+    # Only cast gradients and reduce operations to BF16/FP16 for memory savings
     if torch.cuda.is_bf16_supported():
         mp_policy = MixedPrecision(
-            param_dtype=torch.bfloat16,
+            param_dtype=torch.float32,
             reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
+            buffer_dtype=torch.float32,
         )
         if should_print:
-            print("Using BF16 mixed precision")
+            print("Using mixed precision: FP32 params, BF16 reduce (cuFFT compatible)")
     else:
         mp_policy = MixedPrecision(
-            param_dtype=torch.float16,
+            param_dtype=torch.float32,
             reduce_dtype=torch.float16,
-            buffer_dtype=torch.float16,
+            buffer_dtype=torch.float32,
         )
         if should_print:
-            print("Using FP16 mixed precision")
+            print("Using mixed precision: FP32 params, FP16 reduce (cuFFT compatible)")
 
     # Move model to device before FSDP wrapping
     model = model.to(device)
