@@ -6,7 +6,15 @@ import torch
 import torch.multiprocessing as mp
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    ModuleWrapPolicy,
+)
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    CheckpointImpl,
+    apply_activation_checkpointing,
+)
 from torch.utils.data.distributed import DistributedSampler
 
 from train import train_one_epoch
@@ -27,6 +35,14 @@ from utils.settings import (
     wandb_init,
 )
 from valid import valid_multi_gpu
+
+# Import model layers for FSDP wrapping and checkpointing
+from models.demucs4ht import HEncLayer, HDecLayer
+try:
+    from demucs.transformer import CrossTransformerEncoder
+except ImportError:
+    CrossTransformerEncoder = None
+from models.demucs4ht_internal_fusion import CrossTransformerEncoderWithLatents
 
 warnings.filterwarnings("ignore")
 
@@ -58,11 +74,19 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
     torch.cuda.set_device(device)
 
     # Configure FSDP wrapping policy
-    # Wrap layers larger than 1M parameters
-    auto_wrap_policy = functools.partial(
-        size_based_auto_wrap_policy,
-        min_num_params=1_000_000,  # 1M parameters
-    )
+    # We use ModuleWrapPolicy to specifically target model layers
+    # This ensures they are sharded individually
+    wrap_classes = {HEncLayer, HDecLayer, CrossTransformerEncoderWithLatents}
+    if CrossTransformerEncoder is not None:
+        wrap_classes.add(CrossTransformerEncoder)
+    
+    # Also include local transformer layers if we can access them
+    # For now, wrapping the high-level blocks is usually sufficient
+    
+    fsdp_wrap_policy = ModuleWrapPolicy(wrap_classes)
+    
+    if should_print:
+        print(f"FSDP Wrapping Policy targets: {[c.__name__ for c in wrap_classes]}")
 
     # Configure mixed precision
     # Use FP32 for parameters to avoid cuFFT BFloat16 incompatibility with STFT
@@ -95,15 +119,37 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
     model = FSDP(
         model,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
-        auto_wrap_policy=auto_wrap_policy,
+        auto_wrap_policy=fsdp_wrap_policy,
         mixed_precision=mp_policy,
         device_id=device,
         limit_all_gathers=True,
         use_orig_params=True,  # Better compatibility with optimizers
     )
 
+    # Apply Activation Checkpointing (Gradient Checkpointing)
+    # This is critical for reducing memory usage by recomputing activations during backward pass
     if should_print:
-        print("Model wrapped with FSDP successfully")
+        print("Applying activation checkpointing to Transformer blocks...")
+        
+    non_reentrant_wrapper = functools.partial(
+        checkpoint_wrapper,
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+    )
+    
+    # Checkpoint the heavy Transformer blocks
+    # We can also checkpoint HEncLayer/HDecLayer if memory is still tight
+    checkpoint_classes = {CrossTransformerEncoderWithLatents}
+    if CrossTransformerEncoder is not None:
+        checkpoint_classes.add(CrossTransformerEncoder)
+        
+    check_fn = lambda submodule: isinstance(submodule, tuple(checkpoint_classes))
+    
+    apply_activation_checkpointing(
+        model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
+    )
+
+    if should_print:
+        print("Model wrapped with FSDP and Checkpointing successfully")
         print(f"Model: {model.__class__.__name__}")
 
     # Load checkpoint if specified
