@@ -84,8 +84,6 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
 
     # Handle both 2 and 3 return values from dataset
     for i, data in enumerate(pbar):
-        print(f"[Rank {rank}] Starting batch {i} processing (Data loaded)")
-        
         if len(data) == 3:
             batch, mixes, latents = data
         else:
@@ -95,57 +93,51 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
         x = mixes.to(device)
         y = batch.to(device)
         
-        # Debug Input NaNs
-        if torch.isnan(x).any(): print(f"[Rank {rank}] WARNING: NaN in input 'x' at batch {i}")
-        if torch.isnan(y).any(): print(f"[Rank {rank}] WARNING: NaN in target 'y' at batch {i}")
-        
+        # Move latents to device if they exist
         if latents is not None:
             if isinstance(latents, dict):
                 for k, v in latents.items():
                     if isinstance(v, torch.Tensor):
                         latents[k] = v.to(device)
-                        if torch.isnan(latents[k]).any():
-                            print(f"[Rank {rank}] WARNING: NaN in latent '{k}' at batch {i}")
 
         if normalize:
             x, y = normalize_batch(x, y)
 
-        # Debug: Anomaly Detection for NaN Loss
-        with torch.autograd.set_detect_anomaly(True):
-            print(f"[Rank {rank}] Forward pass start")
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                if get_internal_loss:
-                    loss = model(x, y)
-                    if isinstance(device_ids, (list, tuple)):
-                        loss = loss.mean()
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            if get_internal_loss:
+                loss = model(x, y)
+                if isinstance(device_ids, (list, tuple)):
+                    loss = loss.mean()
+            else:
+                if latents is not None:
+                    y_ = model(x, latents=latents)
                 else:
-                    if latents is not None:
-                        y_ = model(x, latents=latents)
-                    else:
-                        y_ = model(x)
-                    loss = multi_loss(y_, y, x)
-            
-            print(f"[Rank {rank}] Forward pass done. Loss: {loss.item()}")
+                    y_ = model(x)
+                loss = multi_loss(y_, y, x)
 
-            loss /= gradient_accumulation_steps
-            
-            print(f"[Rank {rank}] Backward pass start")
+        loss /= gradient_accumulation_steps
+        
+        if use_amp:
             scaler.scale(loss).backward()
-            print(f"[Rank {rank}] Backward pass done")
+        else:
+            loss.backward()
 
         if ((i + 1) % gradient_accumulation_steps == 0) or (i == len(train_loader) - 1):
 
-            scaler.unscale_(optimizer)
+            if use_amp:
+                scaler.unscale_(optimizer)
+                if config.training.grad_clip:
+                    nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if config.training.grad_clip:
+                    nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
+                optimizer.step()
 
-            if config.training.grad_clip:
-                nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
-
-            scaler.step(optimizer)
-            scaler.update()
             if scheduler.name in ['linear_scheduler']:
                 scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            print(f"[Rank {rank}] Optimizer step done")
             
         if ddp:
             with torch.no_grad():
