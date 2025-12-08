@@ -1,40 +1,65 @@
 # coding: utf-8
-__author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
-__version__ = '1.0.5'
+__author__ = "Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/"
+__version__ = "1.0.5"
 
 import argparse
 import sys
+import warnings
+from typing import Callable, List, Union
 
 import numpy as np
-from tqdm.auto import tqdm
 import torch
-import wandb
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from ml_collections import ConfigDict
-from typing import List, Callable, Union
 import torch.distributed as dist
+import torch.nn as nn
+from ml_collections import ConfigDict
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
-from utils.settings import get_scheduler, parse_args_train, initialize_environment_ddp, \
-    initialize_environment, get_model_from_config, wandb_init
-from utils.model_utils import save_weights, normalize_batch, \
-    save_last_weights, initialize_model_and_device
-
-from valid import valid_multi_gpu, valid
-
-import warnings
+import wandb
+from utils.model_utils import (
+    initialize_model_and_device,
+    normalize_batch,
+    save_last_weights,
+    save_weights,
+)
+from utils.settings import (
+    get_model_from_config,
+    get_scheduler,
+    initialize_environment,
+    initialize_environment_ddp,
+    parse_args_train,
+    wandb_init,
+)
+from valid import valid, valid_multi_gpu
 
 warnings.filterwarnings("ignore")
 warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
 
 
-def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.Namespace,
-                    optimizer: torch.optim.Optimizer,
-                    device: torch.device, device_ids: List[int], epoch: int, use_amp: bool,
-                    scaler: torch.cuda.amp.GradScaler,
-                    scheduler,
-                    gradient_accumulation_steps: int, train_loader: torch.utils.data.DataLoader,
-                    multi_loss: Callable[[torch.Tensor, torch.Tensor, torch.Tensor,], torch.Tensor], all_losses=None, world_size=None) -> None:
+def train_one_epoch(
+    model: torch.nn.Module,
+    config: ConfigDict,
+    args: argparse.Namespace,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    device_ids: List[int],
+    epoch: int,
+    use_amp: bool,
+    scaler: torch.cuda.amp.GradScaler,
+    scheduler,
+    gradient_accumulation_steps: int,
+    train_loader: torch.utils.data.DataLoader,
+    multi_loss: Callable[
+        [
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ],
+        torch.Tensor,
+    ],
+    all_losses=None,
+    world_size=None,
+) -> None:
     """
     Train the model for one epoch.
 
@@ -60,25 +85,31 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
     ddp = True if world_size else False
     rank = dist.get_rank() if dist.is_initialized() else 0
     should_print = rank == 0
-    
+
     model.train()
     if not ddp:
         model.to(device)
     if should_print:
-        print(f'Train epoch: {epoch} Learning rate: {optimizer.param_groups[0]["lr"]}')
+        print(f"Train epoch: {epoch} Learning rate: {optimizer.param_groups[0]['lr']}")
         sys.stdout.flush()
-    loss_val = 0.
+    loss_val = 0.0
     total = 0
-    all_losses[f'epoch_{epoch}'] = []
+    all_losses[f"epoch_{epoch}"] = []
 
-    normalize = getattr(config.training, 'normalize', False)
+    normalize = getattr(config.training, "normalize", False)
 
-    get_internal_loss = (args.model_type in ('mel_band_roformer', 'bs_roformer', 'mel_band_conformer', 'bs_conformer')
-                         and not args.use_standard_loss)
+    get_internal_loss = (
+        args.model_type
+        in ("mel_band_roformer", "bs_roformer", "mel_band_conformer", "bs_conformer")
+        and not args.use_standard_loss
+    )
 
     if ddp:
-        pbar = tqdm(train_loader,
-                    dynamic_ncols=True) if dist.get_rank() == 0 else train_loader
+        pbar = (
+            tqdm(train_loader, dynamic_ncols=True)
+            if dist.get_rank() == 0
+            else train_loader
+        )
     else:
         pbar = tqdm(train_loader)
 
@@ -92,7 +123,7 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
 
         x = mixes.to(device)
         y = batch.to(device)
-        
+
         # Move latents to device if they exist
         if latents is not None:
             if isinstance(latents, dict):
@@ -116,40 +147,42 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
                 loss = multi_loss(y_, y, x)
 
         loss /= gradient_accumulation_steps
-        
+
         if use_amp:
             scaler.scale(loss).backward()
         else:
             loss.backward()
 
         if ((i + 1) % gradient_accumulation_steps == 0) or (i == len(train_loader) - 1):
-
             if use_amp:
                 scaler.unscale_(optimizer)
                 if config.training.grad_clip:
-                    nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
+                    nn.utils.clip_grad_norm_(
+                        model.parameters(), config.training.grad_clip
+                    )
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 if config.training.grad_clip:
-                    nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
+                    nn.utils.clip_grad_norm_(
+                        model.parameters(), config.training.grad_clip
+                    )
                 optimizer.step()
 
-            if scheduler.name in ['linear_scheduler']:
+            if scheduler.name in ["linear_scheduler"]:
                 scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            
+
         if ddp:
             with torch.no_grad():
-
-            scaler.unscale_(optimizer)
+                scaler.unscale_(optimizer)
 
             if config.training.grad_clip:
                 nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
 
             scaler.step(optimizer)
             scaler.update()
-            if scheduler.name in ['linear_scheduler']:
+            if scheduler.name in ["linear_scheduler"]:
                 scheduler.step()
             optimizer.zero_grad(set_to_none=True)
         if ddp:
@@ -159,31 +192,52 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
                 loss_copy /= dist.get_world_size()
             if dist.get_rank() == 0:
                 li = loss_copy.item() * gradient_accumulation_steps
-                all_losses[f'epoch_{epoch}'].append(li)
+                all_losses[f"epoch_{epoch}"].append(li)
                 loss_val += li
                 total += 1
-                pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1)})
+                pbar.set_postfix(
+                    {"loss": 100 * li, "avg_loss": 100 * loss_val / (i + 1)}
+                )
                 sys.stdout.flush()
-                wandb.log({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1), 'i': i})
+                wandb.log(
+                    {"loss": 100 * li, "avg_loss": 100 * loss_val / (i + 1), "i": i}
+                )
         else:
             li = loss.item() * gradient_accumulation_steps
-            all_losses[f'epoch_{epoch}'].append(li)
+            all_losses[f"epoch_{epoch}"].append(li)
             loss_val += li
             total += 1
-            pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1)})
-            wandb.log({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1), 'i': i})
+            pbar.set_postfix({"loss": 100 * li, "avg_loss": 100 * loss_val / (i + 1)})
+            wandb.log({"loss": 100 * li, "avg_loss": 100 * loss_val / (i + 1), "i": i})
             loss.detach()
 
     if should_print:
-        print(f'Training loss: {loss_val / total}')
-        wandb.log({'train_loss': loss_val / total, 'epoch': epoch, 'learning_rate': optimizer.param_groups[0]['lr']})
+        print(f"Training loss: {loss_val / total}")
+        wandb.log(
+            {
+                "train_loss": loss_val / total,
+                "epoch": epoch,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+            }
+        )
 
 
-def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, config: ConfigDict,
-                          device: torch.device, device_ids: List[int], best_metric: float,
-                          epoch: int, scheduler: torch.optim.lr_scheduler, optimizer,
-                          all_time_all_metrics, all_losses,  world_size=None, metrics_avg=None, all_metrics=None) -> float:
-
+def compute_epoch_metrics(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    config: ConfigDict,
+    device: torch.device,
+    device_ids: List[int],
+    best_metric: float,
+    epoch: int,
+    scheduler: torch.optim.lr_scheduler,
+    optimizer,
+    all_time_all_metrics,
+    all_losses,
+    world_size=None,
+    metrics_avg=None,
+    all_metrics=None,
+) -> float:
     """
     Compute and log the metrics for the current epoch, and save model weights if the metric improves.
 
@@ -210,14 +264,15 @@ def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, conf
     should_print = not dist.is_initialized() or dist.get_rank() == 0
     if not ddp:
         if torch.cuda.is_available() and len(device_ids) > 1:
-            metrics_avg, all_metrics = valid_multi_gpu(model, args, config, args.device_ids, verbose=False)
+            metrics_avg, all_metrics = valid_multi_gpu(
+                model, args, config, args.device_ids, verbose=False
+            )
         else:
             metrics_avg, all_metrics = valid(model, args, config, device, verbose=False)
         all_time_all_metrics[f"epoch_{epoch}"] = all_metrics
 
     metric_avg = metrics_avg[args.metric_for_scheduler]
     if metric_avg > best_metric:
-
         if args.each_metrics_in_name:
             stem_parts = []
             for stem_name, values in all_metrics[args.metric_for_scheduler].items():
@@ -228,15 +283,11 @@ def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, conf
                     f"{stem_name}_{args.metric_for_scheduler}_{mean_val:.4f}_std_{std_val:.4f}"
                 )
             stem_info = "__".join(stem_parts)
-            store_path = (
-                f"{args.results_path}/model_{args.model_type}_ep_{epoch}_{stem_info}.ckpt"
-            )
+            store_path = f"{args.results_path}/model_{args.model_type}_ep_{epoch}_{stem_info}.ckpt"
         else:
-            store_path = (
-                f"{args.results_path}/model_{args.model_type}_ep_{epoch}_{args.metric_for_scheduler}_{metric_avg:.4f}.ckpt"
-            )
+            store_path = f"{args.results_path}/model_{args.model_type}_ep_{epoch}_{args.metric_for_scheduler}_{metric_avg:.4f}.ckpt"
         if should_print:
-            print(f'Store weights: {store_path}')
+            print(f"Store weights: {store_path}")
             save_weights(
                 store_path=store_path,
                 model=model,
@@ -247,15 +298,15 @@ def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, conf
                 all_losses=all_losses,
                 best_metric=best_metric,
                 args=args,
-                scheduler=scheduler
+                scheduler=scheduler,
             )
         best_metric = metric_avg
 
     if args.save_weights_every_epoch:
-        metric_string = ''
+        metric_string = ""
         for m in metrics_avg:
-            metric_string += '_{}_{:.4f}'.format(m, metrics_avg[m])
-        store_path = f'{args.results_path}/model_{args.model_type}_ep_{epoch}{metric_string}.ckpt'
+            metric_string += "_{}_{:.4f}".format(m, metrics_avg[m])
+        store_path = f"{args.results_path}/model_{args.model_type}_ep_{epoch}{metric_string}.ckpt"
         save_weights(
             store_path=store_path,
             model=model,
@@ -266,21 +317,23 @@ def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, conf
             all_losses=all_losses,
             best_metric=best_metric,
             args=args,
-            scheduler=scheduler
+            scheduler=scheduler,
         )
 
-    if scheduler.name in ['ReduceLROnPlateau']:
+    if scheduler.name in ["ReduceLROnPlateau"]:
         scheduler.step(metric_avg)
 
     if should_print:
-        wandb.log({'metric_main': metric_avg, 'best_metric': best_metric})
+        wandb.log({"metric_main": metric_avg, "best_metric": best_metric})
         for metric_name in metrics_avg:
-            wandb.log({f'metric_{metric_name}': metrics_avg[metric_name]})
+            wandb.log({f"metric_{metric_name}": metrics_avg[metric_name]})
 
     return best_metric
 
 
-def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=None) -> None:
+def train_model(
+    args: Union[argparse.Namespace, None], rank=None, world_size=None
+) -> None:
     """
     Trains the model based on the provided arguments, including data preparation, optimizer setup,
     and loss calculation. The model is trained for multiple epochs with logging via wandb.
@@ -294,12 +347,16 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
         None
     """
 
-    from utils.dataset import prepare_data
-    from utils.model_utils import load_start_checkpoint
-    from utils.model_utils import get_lora
-    from utils.losses import choice_loss
     from torch.cuda.amp.grad_scaler import GradScaler
-    from utils.model_utils import get_optimizer, log_model_info
+
+    from utils.dataset import prepare_data
+    from utils.losses import choice_loss
+    from utils.model_utils import (
+        get_lora,
+        get_optimizer,
+        load_start_checkpoint,
+        log_model_info,
+    )
 
     args = parse_args_train(args)
     ddp = True if world_size else False
@@ -308,9 +365,9 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
     else:
         initialize_environment(args.seed, args.results_path)
     model, config = get_model_from_config(args.model_type, args.config_path)
-    if 'model_type' in config.training:
+    if "model_type" in config.training:
         args.model_type = config.training.model_type
-    use_amp = getattr(config.training, 'use_amp', True)
+    use_amp = getattr(config.training, "use_amp", True)
     device_ids = args.device_ids
     if ddp:
         batch_size = config.training.batch_size
@@ -323,12 +380,14 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
     train_loader = prepare_data(config, args, batch_size)
 
     if args.start_check_point:
-        checkpoint = torch.load(args.start_check_point, weights_only=False, map_location='cpu')
-        load_start_checkpoint(args, model, checkpoint, type_='train')
+        checkpoint = torch.load(
+            args.start_check_point, weights_only=False, map_location="cpu"
+        )
+        load_start_checkpoint(args, model, checkpoint, type_="train")
     model = get_lora(args, config, model)
 
     if ddp:
-        device = torch.device(f'cuda:{rank}')
+        device = torch.device(f"cuda:{rank}")
         model.to(device)
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank])
     else:
@@ -343,16 +402,26 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
             else:
                 valid(model, args, config, device, verbose=True)
 
-    gradient_accumulation_steps = int(getattr(config.training, 'gradient_accumulation_steps', 1))
+    gradient_accumulation_steps = int(
+        getattr(config.training, "gradient_accumulation_steps", 1)
+    )
 
     # load optimizer
     optimizer = get_optimizer(config, model)
     scheduler = get_scheduler(config, optimizer)
 
-    if args.start_check_point and "optimizer_state_dict" in checkpoint and args.load_optimizer:
+    if (
+        args.start_check_point
+        and "optimizer_state_dict" in checkpoint
+        and args.load_optimizer
+    ):
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-    if args.start_check_point and "scheduler_state_dict" in checkpoint and args.load_scheduler:
+    if (
+        args.start_check_point
+        and "scheduler_state_dict" in checkpoint
+        and args.load_scheduler
+    ):
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
     # load num epoch
@@ -364,7 +433,7 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
     if args.start_check_point and "best_metric" in checkpoint and args.load_best_metric:
         best_metric = checkpoint["best_metric"]
     else:
-        best_metric = float('-inf')
+        best_metric = float("-inf")
 
     if args.start_check_point and "all_metrics" in checkpoint and args.load_all_metrics:
         all_time_all_metrics = checkpoint["all_metrics"]
@@ -409,19 +478,45 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
             f"Optimizer: {config.training.optimizer}"
         )
 
-        print(f'Train for: {config.training.num_epochs} epochs')
+        print(f"Train for: {config.training.num_epochs} epochs")
         log_model_info(model, args.results_path)
 
     for epoch in range(start_epoch, config.training.num_epochs):
         if ddp:
             train_loader.sampler.set_epoch(epoch)
 
-        train_one_epoch(model, config, args, optimizer, device, device_ids, epoch,
-                        use_amp, scaler, scheduler, gradient_accumulation_steps, train_loader, multi_loss, all_losses, world_size)
+        train_one_epoch(
+            model,
+            config,
+            args,
+            optimizer,
+            device,
+            device_ids,
+            epoch,
+            use_amp,
+            scaler,
+            scheduler,
+            gradient_accumulation_steps,
+            train_loader,
+            multi_loss,
+            all_losses,
+            world_size,
+        )
         if should_print:
-            save_last_weights(args, model, device_ids, optimizer, epoch, all_time_all_metrics, best_metric, scheduler)
+            save_last_weights(
+                args,
+                model,
+                device_ids,
+                optimizer,
+                epoch,
+                all_time_all_metrics,
+                best_metric,
+                scheduler,
+            )
         if ddp:
-            metrics_avg, all_metrics = valid_multi_gpu(model, args, config, args.device_ids, verbose=False)
+            metrics_avg, all_metrics = valid_multi_gpu(
+                model, args, config, args.device_ids, verbose=False
+            )
             if rank == 0:
                 all_time_all_metrics[f"epoch_{epoch}"] = all_metrics
                 best_metric = compute_epoch_metrics(
@@ -438,7 +533,7 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
                     all_losses=all_losses,
                     world_size=world_size,
                     metrics_avg=metrics_avg,
-                    all_metrics=all_metrics
+                    all_metrics=all_metrics,
                 )
         else:
             best_metric = compute_epoch_metrics(
