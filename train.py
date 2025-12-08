@@ -175,18 +175,6 @@ def train_one_epoch(
 
         if ddp:
             with torch.no_grad():
-                scaler.unscale_(optimizer)
-
-            if config.training.grad_clip:
-                nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
-
-            scaler.step(optimizer)
-            scaler.update()
-            if scheduler.name in ["linear_scheduler"]:
-                scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-        if ddp:
-            with torch.no_grad():
                 loss_copy = loss.detach().clone()
                 dist.all_reduce(loss_copy, op=dist.ReduceOp.SUM)
                 loss_copy /= dist.get_world_size()
