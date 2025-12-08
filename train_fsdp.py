@@ -189,6 +189,11 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
     # Setup loss function
     multi_loss = choice_loss(args, config)
 
+    # Memory management
+    if args.set_per_process_memory_fraction:
+        torch.cuda.set_per_process_memory_fraction(1.0)
+    torch.cuda.empty_cache()
+
     # Initialize wandb
     if should_print:
         batch_size = config.training.batch_size
@@ -198,7 +203,7 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
     if should_print:
         print(f"Instruments: {config.training.instruments}")
         print(
-            f"Metrics for training: {config.training.metrics}. Metric for scheduler: {config.training.metrics[0]}"
+            f"Metrics for training: {args.metrics}. Metric for scheduler: {args.metric_for_scheduler}"
         )
         print(
             f"Patience: {config.training.patience} Reduce factor: {config.training.reduce_factor}"
@@ -223,7 +228,7 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
             args,
             optimizer,
             device,
-            args.device_ids,
+            [rank],
             epoch,
             use_amp,
             scaler,
@@ -240,7 +245,7 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
             save_last_weights(
                 args,
                 model,
-                args.device_ids,
+                [rank],
                 optimizer,
                 epoch,
                 all_time_all_metrics,
@@ -258,7 +263,7 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
             all_time_all_metrics[f"epoch_{epoch}"] = all_metrics
 
             # Check if this is the best model
-            metric_name = config.training.metrics[0]
+            metric_name = args.metric_for_scheduler
             current_metric = metrics_avg.get(metric_name, float("-inf"))
 
             if current_metric > best_metric:
@@ -269,7 +274,7 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
                 save_weights(
                     store_path=store_path,
                     model=model,
-                    device_ids=args.device_ids,
+                    device_ids=[rank],
                     optimizer=optimizer,
                     epoch=epoch,
                     all_time_all_metrics=all_time_all_metrics,
