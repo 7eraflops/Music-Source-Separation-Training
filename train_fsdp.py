@@ -302,5 +302,5 @@ def train_model_fsdp_spawn(args=None):
 if __name__ == "__main__":
     from utils.settings import parse_args_train
 
-    args = parse_args_train()
+    args = parse_args_train(None)
     train_model_fsdp_spawn(args)
