@@ -11,6 +11,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from train import train_one_epoch
 from utils.dataset import MSSDataset
+from utils.losses import choice_loss
 from utils.model_utils import (
     get_lora,
     get_optimizer,
@@ -25,6 +26,7 @@ from utils.settings import (
     parse_args_train,
     wandb_init,
 )
+from valid import valid_multi_gpu
 
 warnings.filterwarnings("ignore")
 
@@ -184,13 +186,16 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
     use_amp = getattr(config.training, "use_amp", True)
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+    # Setup loss function
+    multi_loss = choice_loss(args, config)
+
     # Initialize wandb
     if should_print:
-        wandb_init(args, config)
+        batch_size = config.training.batch_size
+        wandb_init(args, config, batch_size)
 
     # Print training info
     if should_print:
-        batch_size = config.training.batch_size
         print(f"Instruments: {config.training.instruments}")
         print(
             f"Metrics for training: {config.training.metrics}. Metric for scheduler: {config.training.metrics[0]}"
@@ -225,7 +230,7 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
             scheduler,
             gradient_accumulation_steps,
             train_loader,
-            None,
+            multi_loss,
             all_losses,
             world_size,
         )
@@ -245,8 +250,6 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
             )
 
         # Validation
-        from utils.valid import valid_multi_gpu
-
         metrics_avg, all_metrics = valid_multi_gpu(
             model, args, config, args.device_ids, verbose=False
         )
@@ -295,7 +298,11 @@ def train_model_fsdp_spawn(args=None):
             train_model_fsdp, args=(world_size, args), nprocs=world_size, join=True
         )
     except Exception as e:
-        cleanup_ddp()
+        # Only cleanup if distributed was initialized
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            cleanup_ddp()
         raise e
 
 
