@@ -59,9 +59,11 @@ class LatentPreprocessor(nn.Module):
         seq_lengths = []
 
         # Downsampling factor to prevent OOM
-        # Reduces Frequency by 4, Time by 64
-        pool_kernel = (4, 64)
-        pool_stride = (4, 64)
+        # Reduces Frequency by 2, Time by 32
+        # Estimated token count: ~64k per sample
+        # Estimated Memory Cost (B=2, BF16): ~3.8GB
+        pool_kernel = (2, 32)
+        pool_stride = (2, 32)
 
         if "bs_roformer" in latents and "bs_roformer" in self.latent_sources:
             bsr = latents["bs_roformer"]  # (1, T, Fr, C) e.g., (1, 52848, 62, 384)
@@ -70,11 +72,14 @@ class LatentPreprocessor(nn.Module):
             if bsr.dim() == 5 and bsr.shape[1] == 1:
                 bsr = bsr.squeeze(1)
 
+            # Sanitize input: replace NaN/Inf with 0 to prevent NaN loss
+            if not torch.isfinite(bsr).all():
+                bsr = torch.nan_to_num(bsr, nan=0.0, posinf=0.0, neginf=0.0)
+
             # Permute to (1, C, Fr, T)
             bsr = bsr.permute(0, 3, 2, 1)  # (1, 384, 62, T)
             
-            # Downsample to reduce sequence length (OOM fix)
-            # e.g. 3M tokens -> 15k tokens
+            # Downsample to reduce sequence length
             bsr = F.avg_pool2d(bsr, kernel_size=pool_kernel, stride=pool_stride, ceil_mode=True)
 
             # Flatten Fr*T: (1, 384, Fr*T)
@@ -97,9 +102,13 @@ class LatentPreprocessor(nn.Module):
             if scn.dim() == 5 and scn.shape[1] == 1:
                 scn = scn.squeeze(1)
 
+            # Sanitize input: replace NaN/Inf with 0 to prevent NaN loss
+            if not torch.isfinite(scn).all():
+                scn = torch.nan_to_num(scn, nan=0.0, posinf=0.0, neginf=0.0)
+
             # Already in (1, C, Fr, T) format
             
-            # Downsample to reduce sequence length (OOM fix)
+            # Downsample to reduce sequence length
             scn = F.avg_pool2d(scn, kernel_size=pool_kernel, stride=pool_stride, ceil_mode=True)
             
             # Flatten Fr*T: (1, 256, Fr*T)
