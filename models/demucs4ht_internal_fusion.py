@@ -58,6 +58,11 @@ class LatentPreprocessor(nn.Module):
         processed = []
         seq_lengths = []
 
+        # Downsampling factor to prevent OOM
+        # Reduces Frequency by 4, Time by 64
+        pool_kernel = (4, 64)
+        pool_stride = (4, 64)
+
         if "bs_roformer" in latents and "bs_roformer" in self.latent_sources:
             bsr = latents["bs_roformer"]  # (1, T, Fr, C) e.g., (1, 52848, 62, 384)
 
@@ -67,6 +72,10 @@ class LatentPreprocessor(nn.Module):
 
             # Permute to (1, C, Fr, T)
             bsr = bsr.permute(0, 3, 2, 1)  # (1, 384, 62, T)
+            
+            # Downsample to reduce sequence length (OOM fix)
+            # e.g. 3M tokens -> 15k tokens
+            bsr = F.avg_pool2d(bsr, kernel_size=pool_kernel, stride=pool_stride, ceil_mode=True)
 
             # Flatten Fr*T: (1, 384, Fr*T)
             bsr = bsr.flatten(2)
@@ -89,6 +98,10 @@ class LatentPreprocessor(nn.Module):
                 scn = scn.squeeze(1)
 
             # Already in (1, C, Fr, T) format
+            
+            # Downsample to reduce sequence length (OOM fix)
+            scn = F.avg_pool2d(scn, kernel_size=pool_kernel, stride=pool_stride, ceil_mode=True)
+            
             # Flatten Fr*T: (1, 256, Fr*T)
             scn = scn.flatten(2)
 
