@@ -340,10 +340,8 @@ class MSSDataset(torch.utils.data.Dataset):
         # Load each latent source
         for source_name, latent_file in latent_files.items():
             try:
-                # Load with mmap=True to avoid loading the entire file into RAM.
-                # This is crucial for large latent files (3-4GB).
                 latents = torch.load(
-                    latent_file, map_location="cpu", weights_only=False, mmap=True
+                    latent_file, map_location="cpu", weights_only=False
                 )
 
                 # Handle Tensor format latents
