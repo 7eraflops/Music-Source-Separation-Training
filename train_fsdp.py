@@ -3,25 +3,23 @@ import os
 import warnings
 
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.utils.data.distributed import DistributedSampler
 
-from train import (
-    compute_epoch_metrics,
-    get_lora,
-    save_best_weights,
-    save_last_weights,
-    train_one_epoch,
-)
+from train import train_one_epoch
 from utils.dataset import MSSDataset
+from utils.model_utils import (
+    get_lora,
+    get_optimizer,
+    save_last_weights,
+    save_weights,
+)
 from utils.settings import (
     cleanup_ddp,
     get_model_from_config,
-    get_optimizer,
     get_scheduler,
     initialize_environment_ddp,
     parse_args_train,
@@ -241,6 +239,7 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
                 optimizer,
                 epoch,
                 all_time_all_metrics,
+                all_losses,
                 best_metric,
                 scheduler,
             )
@@ -261,15 +260,20 @@ def train_model_fsdp(rank: int, world_size: int, args=None):
 
             if current_metric > best_metric:
                 best_metric = current_metric
-                save_best_weights(
-                    args,
-                    model,
-                    args.device_ids,
-                    optimizer,
-                    epoch,
-                    all_time_all_metrics,
-                    best_metric,
-                    scheduler,
+                # Save best model checkpoint
+                store_path = f"{args.results_path}/model_{args.model_type}_ep_{epoch}_{metric_name}_{current_metric:.4f}.ckpt"
+                print(f"Store best weights: {store_path}")
+                save_weights(
+                    store_path=store_path,
+                    model=model,
+                    device_ids=args.device_ids,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    all_time_all_metrics=all_time_all_metrics,
+                    all_losses=all_losses,
+                    best_metric=best_metric,
+                    args=args,
+                    scheduler=scheduler,
                 )
                 print(f"New best {metric_name}: {best_metric:.4f}")
 
