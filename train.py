@@ -58,7 +58,9 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
         None
     """
     ddp = True if world_size else False
-    should_print = not dist.is_initialized() or dist.get_rank() == 0
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    should_print = rank == 0
+    
     model.train()
     if not ddp:
         model.to(device)
@@ -82,6 +84,8 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
 
     # Handle both 2 and 3 return values from dataset
     for i, data in enumerate(pbar):
+        print(f"[Rank {rank}] Starting batch {i} processing (Data loaded)")
+        
         if len(data) == 3:
             batch, mixes, latents = data
         else:
@@ -91,47 +95,60 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
         x = mixes.to(device)
         y = batch.to(device)
         
-        # Move latents to device if they exist
+        # Debug Input NaNs
+        if torch.isnan(x).any(): print(f"[Rank {rank}] WARNING: NaN in input 'x' at batch {i}")
+        if torch.isnan(y).any(): print(f"[Rank {rank}] WARNING: NaN in target 'y' at batch {i}")
+        
         if latents is not None:
-            # latents is a dict of tensors or None
-            # We need to verify if it's a dict and move tensors to device
             if isinstance(latents, dict):
                 for k, v in latents.items():
                     if isinstance(v, torch.Tensor):
                         latents[k] = v.to(device)
-            # Handle case where collate_fn might stack Nones or similar if dataset returned None
-            # But default collate with None usually fails or creates a list of Nones.
-            # If we modified __getitem__ to return None, default collate might fail if batch has mixed types?
-            # MSSDataset returns None for latents in some cases. 
-            # Default collate requires consistent types. 
-            # WE NEED TO FIX DATASET TO RETURN EMPTY DICT INSTEAD OF NONE?
-            # Or check how default collate handles None. It usually crashes.
-            # I will update dataset code to return empty dict or handle it here.
-            # Assuming dataset returns None, default_collate crashes.
-            # Actually, I changed dataset to return None in some branches. 
-            # I should probably change that to {} or handle collation.
-            # For now, let's assume I will fix dataset or it returns empty dict.
-            pass
+                        if torch.isnan(latents[k]).any():
+                            print(f"[Rank {rank}] WARNING: NaN in latent '{k}' at batch {i}")
 
         if normalize:
             x, y = normalize_batch(x, y)
 
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            if get_internal_loss:
-                loss = model(x, y)
-                if isinstance(device_ids, (list, tuple)):
-                    loss = loss.mean()
-            else:
-                if latents is not None:
-                    y_ = model(x, latents=latents)
+        # Debug: Anomaly Detection for NaN Loss
+        with torch.autograd.set_detect_anomaly(True):
+            print(f"[Rank {rank}] Forward pass start")
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                if get_internal_loss:
+                    loss = model(x, y)
+                    if isinstance(device_ids, (list, tuple)):
+                        loss = loss.mean()
                 else:
-                    y_ = model(x)
-                loss = multi_loss(y_, y, x)
+                    if latents is not None:
+                        y_ = model(x, latents=latents)
+                    else:
+                        y_ = model(x)
+                    loss = multi_loss(y_, y, x)
+            
+            print(f"[Rank {rank}] Forward pass done. Loss: {loss.item()}")
 
-        loss /= gradient_accumulation_steps
-        scaler.scale(loss).backward()
+            loss /= gradient_accumulation_steps
+            
+            print(f"[Rank {rank}] Backward pass start")
+            scaler.scale(loss).backward()
+            print(f"[Rank {rank}] Backward pass done")
 
         if ((i + 1) % gradient_accumulation_steps == 0) or (i == len(train_loader) - 1):
+
+            scaler.unscale_(optimizer)
+
+            if config.training.grad_clip:
+                nn.utils.clip_grad_norm_(model.parameters(), config.training.grad_clip)
+
+            scaler.step(optimizer)
+            scaler.update()
+            if scheduler.name in ['linear_scheduler']:
+                scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            print(f"[Rank {rank}] Optimizer step done")
+            
+        if ddp:
+            with torch.no_grad():
 
             scaler.unscale_(optimizer)
 
