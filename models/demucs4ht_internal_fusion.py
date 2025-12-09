@@ -225,6 +225,7 @@ class LatentCrossAttentionLayer(nn.Module):
     """
     Cross-attention layer for fusing external latents.
     Query: freq branch, Key/Value: external latents
+    Refactored to use F.scaled_dot_product_attention for FlashAttention support.
     """
 
     def __init__(
@@ -237,9 +238,18 @@ class LatentCrossAttentionLayer(nn.Module):
         layer_norm_eps=1e-5,
     ):
         super().__init__()
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True
-        )
+        self.nhead = nhead
+        self.d_model = d_model
+        self.head_dim = d_model // nhead
+        assert self.head_dim * nhead == d_model, "d_model must be divisible by nhead"
+
+        # Manual projections for SDPA
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        self.dropout_p = dropout
 
         # Feedforward network
         self.linear1 = nn.Linear(d_model, dim_feedforward)
@@ -263,27 +273,60 @@ class LatentCrossAttentionLayer(nn.Module):
             (B, C, seq_len_q)
         """
         # Reshape for attention: (B, C, L) -> (B, L, C)
-        q = query.transpose(1, 2)
-        kv = key_value.transpose(1, 2)
+        q_in = query.transpose(1, 2)
+        kv_in = key_value.transpose(1, 2)
+        
+        B, L_q, _ = q_in.shape
+        _, L_kv, _ = kv_in.shape
 
-        # Cross-attention with optional key padding mask
-        q2 = self.norm1(q)
+        # Pre-norm (standard for this architecture)
+        q = self.norm1(q_in)
+        
+        # Projections: (B, L, d_model)
+        q = self.q_proj(q)
+        k = self.k_proj(kv_in)
+        v = self.v_proj(kv_in)
 
-        # Convert mask: MultiheadAttention expects False for valid, True for invalid
+        # Reshape for SDPA: (B, nhead, L, head_dim)
+        q = q.view(B, L_q, self.nhead, self.head_dim).transpose(1, 2)
+        k = k.view(B, L_kv, self.nhead, self.head_dim).transpose(1, 2)
+        v = v.view(B, L_kv, self.nhead, self.head_dim).transpose(1, 2)
+
+        # Mask preparation
+        # Adaptive Pooling (applied in LatentPreprocessor) guarantees no padding,
+        # so key_padding_mask is generally None now. 
+        # If it were present, we'd need to reshape it for SDPA.
         attn_mask = None
         if key_padding_mask is not None:
-            attn_mask = ~key_padding_mask  # Invert: True for padded (invalid) positions
+            # Logic: mask is True for VALID. 
+            # SDPA boolean mask expects True for IGNORED (Padded).
+            # So we need ~mask.
+            # Shape: (B, L_kv) -> (B, 1, 1, L_kv) for broadcasting
+            sdpa_mask = ~key_padding_mask
+            sdpa_mask = sdpa_mask.unsqueeze(1).unsqueeze(1) 
+            attn_mask = sdpa_mask
 
-        q2, _ = self.cross_attn(q2, kv, kv, key_padding_mask=attn_mask)
-        q = q + self.dropout1(q2)
+        # Flash Attention / SDPA
+        x = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=self.dropout_p if self.training else 0.0
+        )
+
+        # Reshape back: (B, nhead, L, head_dim) -> (B, L, d_model)
+        x = x.transpose(1, 2).contiguous().view(B, L_q, self.d_model)
+        
+        # Output projection
+        x = self.out_proj(x)
+        
+        # Residual connection + Post-processing
+        q_out = q_in + self.dropout1(x)
 
         # Feedforward
-        q2 = self.norm2(q)
-        q2 = self.linear2(self.dropout(self.activation(self.linear1(q2))))
-        q = q + self.dropout2(q2)
+        x2 = self.norm2(q_out)
+        x2 = self.linear2(self.dropout(self.activation(self.linear1(x2))))
+        q_out = q_out + self.dropout2(x2)
 
         # Reshape back: (B, L, C) -> (B, C, L)
-        return q.transpose(1, 2)
+        return q_out.transpose(1, 2)
 
 
 class CrossTransformerEncoderWithLatents(nn.Module):
