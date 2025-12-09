@@ -341,7 +341,7 @@ class MSSDataset(torch.utils.data.Dataset):
         for source_name, latent_file in latent_files.items():
             try:
                 latents = torch.load(
-                    latent_file, map_location="cpu", weights_only=False
+                    latent_file, map_location="cpu", weights_only=False, mmap=True
                 )
 
                 # Handle Tensor format latents
