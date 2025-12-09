@@ -140,7 +140,7 @@ def train_one_epoch(
                 if isinstance(device_ids, (list, tuple)):
                     loss = loss.mean()
             else:
-                if latents is not None:
+                if latents:
                     y_ = model(x, latents=latents)
                 else:
                     y_ = model(x)
