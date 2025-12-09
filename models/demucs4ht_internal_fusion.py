@@ -44,125 +44,76 @@ class LatentPreprocessor(nn.Module):
             # SCNet-XL has 256 channels
             self.scnet_proj = nn.Conv1d(256, model_channels, 1)
 
-    def forward(self, latents, batch_size):
+    def forward(self, latents, batch_size, target_shape=None):
         """
         Args:
             latents: dict with keys like 'bs_roformer', 'scnet_xl'
             batch_size: target batch size B
+            target_shape: (Freq, Time) tuple for Adaptive Pooling. 
+                          This aligns external latents to the HTDemucs bottleneck resolution.
 
         Returns:
-            combined: Tensor of shape (B, C_total, seq_len) where C_total is sum of all latent channels
-                     All sources are padded to a common sequence length (max of all)
-            mask: Boolean tensor of shape (B, seq_len) where True indicates valid (non-padded) positions
+            combined: Tensor of shape (B, C_total, seq_len) where C_total is sum of all latent channels.
+                     Sequence length will be exactly Freq * Time from target_shape.
+            mask: None (no padding needed as adaptive pool forces exact size)
         """
         processed = []
-        seq_lengths = []
-
-        # Downsampling factor to prevent OOM
-        # Reduces Frequency by 2, Time by 32
-        # Estimated token count: ~64k per sample
-        # Estimated Memory Cost (B=2, BF16): ~3.8GB
-        pool_kernel = (2, 32)
-        pool_stride = (2, 32)
+        
+        if target_shape is None:
+            target_shape = (8, 400) # Fallback
 
         if "bs_roformer" in latents and "bs_roformer" in self.latent_sources:
-            bsr = latents["bs_roformer"]  # (1, T, Fr, C) e.g., (1, 52848, 62, 384)
+            bsr = latents["bs_roformer"]  # (1, T, Fr, C)
 
-            # Handle DataLoader collation that might add extra dim
+            # Handle DataLoader collation
             if bsr.dim() == 5 and bsr.shape[1] == 1:
                 bsr = bsr.squeeze(1)
 
-            # Sanitize input: replace NaN/Inf with 0 to prevent NaN loss
+            # Sanitize input
             if not torch.isfinite(bsr).all():
                 bsr = torch.nan_to_num(bsr, nan=0.0, posinf=0.0, neginf=0.0)
 
             # Permute to (1, C, Fr, T)
-            bsr = bsr.permute(0, 3, 2, 1)  # (1, 384, 62, T)
+            bsr = bsr.permute(0, 3, 2, 1)
             
-            # Downsample to reduce sequence length
-            bsr = F.avg_pool2d(bsr, kernel_size=pool_kernel, stride=pool_stride, ceil_mode=True)
+            # Adaptive Pool to match bottleneck resolution
+            bsr = F.adaptive_avg_pool2d(bsr, target_shape)
 
-            # Flatten Fr*T: (1, 384, Fr*T)
             bsr = bsr.flatten(2)
-
-            # Project channels: (1, model_channels, seq_len)
             bsr = self.bs_roformer_proj(bsr)
 
-            # Handle batch size: replicate to match B
             if batch_size > 1:
                 bsr = bsr.expand(batch_size, -1, -1)
 
             processed.append(bsr)
-            seq_lengths.append(bsr.shape[2])
 
         if "scnet_xl" in latents and "scnet_xl" in self.latent_sources:
-            scn = latents["scnet_xl"]  # (1, C, Fr, T) e.g., (1, 256, 88, 46172)
+            scn = latents["scnet_xl"]  # (1, C, Fr, T)
 
-            # Handle DataLoader collation
             if scn.dim() == 5 and scn.shape[1] == 1:
                 scn = scn.squeeze(1)
 
-            # Sanitize input: replace NaN/Inf with 0 to prevent NaN loss
             if not torch.isfinite(scn).all():
                 scn = torch.nan_to_num(scn, nan=0.0, posinf=0.0, neginf=0.0)
 
             # Already in (1, C, Fr, T) format
+            scn = F.adaptive_avg_pool2d(scn, target_shape)
             
-            # Downsample to reduce sequence length
-            scn = F.avg_pool2d(scn, kernel_size=pool_kernel, stride=pool_stride, ceil_mode=True)
-            
-            # Flatten Fr*T: (1, 256, Fr*T)
             scn = scn.flatten(2)
-
-            # Project channels: (1, model_channels, seq_len)
             scn = self.scnet_proj(scn)
 
-            # Handle batch size
             if batch_size > 1:
                 scn = scn.expand(batch_size, -1, -1)
 
             processed.append(scn)
-            seq_lengths.append(scn.shape[2])
 
         if len(processed) == 0:
             return None, None
 
-        # Find common sequence length (use maximum to preserve full resolution)
-        target_len = max(seq_lengths)
-
-        # Pad all latents to common length and create attention mask
-        aligned = []
-        masks = []
-        for i, latent in enumerate(processed):
-            current_len = seq_lengths[i]
-            if current_len < target_len:
-                # Pad shorter sequences with zeros
-                pad_len = target_len - current_len
-                latent = F.pad(latent, (0, pad_len), mode="constant", value=0)
-
-                # Create mask: True for valid positions, False for padded positions
-                mask = torch.ones(
-                    batch_size, target_len, dtype=torch.bool, device=latent.device
-                )
-                mask[:, current_len:] = False
-            else:
-                # No padding needed, all positions are valid
-                mask = torch.ones(
-                    batch_size, target_len, dtype=torch.bool, device=latent.device
-                )
-
-            aligned.append(latent)
-            masks.append(mask)
-
         # Concatenate along channel dimension
-        # Result: (B, n_sources * model_channels, seq_len)
-        combined = torch.cat(aligned, dim=1)
+        combined = torch.cat(processed, dim=1)
 
-        # Combine masks: position is valid if ALL sources have valid data at that position
-        # This ensures we only attend to positions where all latents have real data
-        combined_mask = torch.stack(masks, dim=0).all(dim=0)  # (B, seq_len)
-
-        return combined, combined_mask
+        return combined, None
 
 
 class TransformerEncoderLayer(nn.Module):
