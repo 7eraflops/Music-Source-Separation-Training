@@ -213,7 +213,13 @@ class MSSDataset(torch.utils.data.Dataset):
         self.latents_path = latents_path
 
         # Latent configuration
-        self.latent_hop_length = 512  # Standard for BS-Roformer
+        # Hardcoded hop lengths for specific latent sources
+        self.latent_hop_length_map = {
+            'bs_roformer': 441,
+            'scnet_xl': 1024,
+            'default': 512 # Fallback for any other latent source
+        }
+
         self.latent_map = {}
         if self.latents_path:
             if self.verbose and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -344,11 +350,14 @@ class MSSDataset(torch.utils.data.Dataset):
                     latent_file, map_location="cpu", weights_only=False, mmap=True
                 )
 
+                # Get the appropriate hop length for the current source
+                current_hop_length = self.latent_hop_length_map.get(source_name, self.latent_hop_length_map['default'])
+
                 # Handle Tensor format latents
                 if isinstance(latents, torch.Tensor):
-                    # Calculate frames
-                    start_frame = offset // self.latent_hop_length
-                    num_frames = chunk_size // self.latent_hop_length
+                    # Calculate frames based on the current_hop_length
+                    start_frame = offset // current_hop_length
+                    num_frames = chunk_size // current_hop_length
                     end_frame = start_frame + num_frames
 
                     if latents.ndim == 4:

@@ -44,26 +44,23 @@ class LatentPreprocessor(nn.Module):
             # SCNet-XL has 256 channels
             self.scnet_proj = nn.Conv1d(256, model_channels, 1)
 
-    def forward(self, latents, batch_size, target_shape=None):
+    def forward(self, latents, batch_size):
         """
         Args:
             latents: dict with keys like 'bs_roformer', 'scnet_xl'
             batch_size: target batch size B
-            target_shape: (Freq, Time) tuple for Adaptive Pooling. 
-                          This aligns external latents to the HTDemucs bottleneck resolution.
 
         Returns:
-            combined: Tensor of shape (B, C_total, seq_len) where C_total is sum of all latent channels.
-                     Sequence length will be exactly Freq * Time from target_shape.
-            mask: None (no padding needed as adaptive pool forces exact size)
+            combined: Tensor of shape (B, C, seq_len) where seq_len is sum of all latent sequence lengths.
+            mask: None
         """
         processed = []
-        
-        if target_shape is None:
-            target_shape = (8, 400) # Fallback
 
         if "bs_roformer" in latents and "bs_roformer" in self.latent_sources:
             bsr = latents["bs_roformer"]  # (1, T, Fr, C)
+
+            # Detach to prevent gradient propagation
+            bsr = bsr.detach()
 
             # Handle DataLoader collation
             if bsr.dim() == 5 and bsr.shape[1] == 1:
@@ -75,10 +72,9 @@ class LatentPreprocessor(nn.Module):
 
             # Permute to (1, C, Fr, T)
             bsr = bsr.permute(0, 3, 2, 1)
-            
-            # Adaptive Pool to match bottleneck resolution
-            bsr = F.adaptive_avg_pool2d(bsr, target_shape)
 
+            # Flatten Fr and T into a single sequence dimension
+            # (1, C, Fr, T) -> (1, C, Fr * T)
             bsr = bsr.flatten(2)
             bsr = self.bs_roformer_proj(bsr)
 
@@ -90,15 +86,17 @@ class LatentPreprocessor(nn.Module):
         if "scnet_xl" in latents and "scnet_xl" in self.latent_sources:
             scn = latents["scnet_xl"]  # (1, C, Fr, T)
 
+            # Detach to prevent gradient propagation
+            scn = scn.detach()
+
             if scn.dim() == 5 and scn.shape[1] == 1:
                 scn = scn.squeeze(1)
 
             if not torch.isfinite(scn).all():
                 scn = torch.nan_to_num(scn, nan=0.0, posinf=0.0, neginf=0.0)
 
-            # Already in (1, C, Fr, T) format
-            scn = F.adaptive_avg_pool2d(scn, target_shape)
-            
+            # Flatten Fr and T into a single sequence dimension
+            # (1, C, Fr, T) -> (1, C, Fr * T)
             scn = scn.flatten(2)
             scn = self.scnet_proj(scn)
 
@@ -110,8 +108,8 @@ class LatentPreprocessor(nn.Module):
         if len(processed) == 0:
             return None, None
 
-        # Concatenate along channel dimension
-        combined = torch.cat(processed, dim=1)
+        # Concatenate along sequence dimension (dim=2)
+        combined = torch.cat(processed, dim=2)
 
         return combined, None
 
@@ -414,10 +412,6 @@ class CrossTransformerEncoderWithLatents(nn.Module):
                 )
             )
 
-        # Projection for external latents if they have multiple sources concatenated
-        # This projects from n_sources * dim back to dim for cross-attention
-        self.latent_kv_proj = nn.Conv1d(dim * len(latent_sources), dim, 1)
-
     def forward(self, x, xt, external_latents=None, latent_mask=None):
         """
         Args:
@@ -441,9 +435,6 @@ class CrossTransformerEncoderWithLatents(nn.Module):
             B, C, Fr, T = x.shape
             x_flat = rearrange(x, "b c f t -> b c (f t)")
 
-            # Project external latents to correct dimension
-            latents_proj = self.latent_kv_proj(external_latents)  # (B, C, seq_len)
-
             # Add latent fusion blocks
             # We append them after the original transformer
             for self_attn, cross_attn in zip(
@@ -459,7 +450,7 @@ class CrossTransformerEncoderWithLatents(nn.Module):
                     x_flat = checkpoint(
                         cross_attn,
                         x_flat,
-                        latents_proj,
+                        external_latents,
                         latent_mask,
                         use_reentrant=False,
                     )
@@ -468,7 +459,7 @@ class CrossTransformerEncoderWithLatents(nn.Module):
                     x_flat = self_attn(x_flat)
                     # Cross-attention: freq <-> external latents with attention mask
                     x_flat = cross_attn(
-                        x_flat, latents_proj, key_padding_mask=latent_mask
+                        x_flat, external_latents, key_padding_mask=latent_mask
                     )
 
             # Reshape back to (B, C, Fr, T)
