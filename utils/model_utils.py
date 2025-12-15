@@ -89,9 +89,6 @@ def demix(
 
     use_amp = getattr(config.training, 'use_amp', True)
     
-    # Latent hop length assumption (BS-Roformer standard)
-    latent_hop = 512
-
     with torch.cuda.amp.autocast(enabled=use_amp):
         with torch.inference_mode():
             # Initialize result and counter tensors
@@ -128,9 +125,20 @@ def demix(
                 
                 # Handle Latents Slicing
                 if latents:
-                    start_frame = i // latent_hop
-                    end_frame = (i + chunk_size) // latent_hop
+                    latent_hop_map = {
+                        'bs_roformer': 441,
+                        'scnet_xl': 1024,
+                        'default': 512
+                    }
+                    
                     for k, v in latents.items():
+                        current_hop = latent_hop_map.get(k, latent_hop_map['default'])
+                        
+                        start_frame = i // current_hop
+                        # Ensure constant length by adding fixed number of frames to start_frame
+                        frames_len = chunk_size // current_hop
+                        end_frame = start_frame + frames_len
+
                         # v is (1, T, F, C) or similar
                         # Assume Dim 1 is Time
                         if v.ndim >= 2:
@@ -142,7 +150,7 @@ def demix(
                             slice_ = v[:, start_f:end_f].to(device)
                             
                             # Pad if necessary (if end_frame > max_t)
-                            expected_frames = (chunk_size) // latent_hop
+                            expected_frames = frames_len
                             # Note: Integer division might cause small off-by-one if chunk_size not multiple of 512
                             # But usually it is.
                             
