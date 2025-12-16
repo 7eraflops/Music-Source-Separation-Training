@@ -434,6 +434,7 @@ class InternalFusionHTDemucs(HTDemucs):
 
         # Transformer
         if self.crosstransformer:
+            freq_dim = x.shape[2]
             if self.bottom_channels:
                 b, c, f, t = x.shape
                 x = rearrange(x, "b c f t-> b c (f t)")
