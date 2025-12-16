@@ -292,7 +292,15 @@ class InternalFusionHTDemucs(HTDemucs):
 
         # Replace the standard transformer with our Interleaved Fusion Transformer
         if self.crosstransformer:
-            transformer_channels = self.crosstransformer.dim
+            # Re-calculate transformer dimension as CrossTransformerEncoder doesn't expose it
+            channels = kwargs.get('channels', 48)
+            growth = kwargs.get('growth', 2)
+            depth = kwargs.get('depth', 4)
+            bottom_channels = kwargs.get('bottom_channels', 0)
+            
+            transformer_channels = channels * growth ** (depth - 1)
+            if bottom_channels > 0:
+                transformer_channels = bottom_channels
             
             # We reconstruct the transformer using the exact same arguments
             # passed to HTDemucs, but utilizing our Interleaved class.
