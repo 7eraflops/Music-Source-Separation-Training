@@ -269,6 +269,7 @@ class InternalFusionHTDemucs(HTDemucs):
         num_latent_blocks=2,
         use_gradient_checkpointing=False,
         normalize=True,
+        freeze_base_model=False,
         # Capture the rest
         **kwargs,
     ):
@@ -279,6 +280,7 @@ class InternalFusionHTDemucs(HTDemucs):
             latent_sources: List of external latent sources to fuse
             num_latent_blocks: Number of latent fusion blocks to add
             normalize: Whether to apply normalization internally (default True for HTDemucs)
+            freeze_base_model: If True, freezes all parameters except the new fusion layers
             **kwargs: Arguments passed to HTDemucs
         """
         # Initialize standard HTDemucs
@@ -349,6 +351,35 @@ class InternalFusionHTDemucs(HTDemucs):
 
         if freeze_encoder:
             self.freeze_encoder_parameters()
+        
+        if freeze_base_model:
+            self.freeze_base_parameters()
+
+    def freeze_base_parameters(self):
+        """
+        Freeze all parameters EXCEPT the new fusion layers and preprocessor.
+        """
+        print("Freezing BASE model parameters (training fusion layers only)...")
+        
+        # 1. Freeze EVERYTHING first
+        for param in self.parameters():
+            param.requires_grad = False
+            
+        # 2. Unfreeze Fusion Layers
+        if self.crosstransformer and hasattr(self.crosstransformer, 'fusion_layers'):
+            print("Unfreezing Fusion Layers...")
+            for param in self.crosstransformer.fusion_layers.parameters():
+                param.requires_grad = True
+                
+        # 3. Unfreeze Latent Preprocessor
+        if hasattr(self, 'latent_preprocessor'):
+            print("Unfreezing Latent Preprocessor...")
+            for param in self.latent_preprocessor.parameters():
+                param.requires_grad = True
+                
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        print(f"Trainable Parameters: {trainable:,} / {total:,} ({trainable/total:.1%})")
 
     def freeze_encoder_parameters(self):
         print("Freezing encoder parameters...")
