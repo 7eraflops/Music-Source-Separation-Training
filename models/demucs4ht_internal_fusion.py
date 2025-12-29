@@ -446,13 +446,19 @@ class InternalFusionHTDemucs(HTDemucs):
         for param in self.parameters():
             param.requires_grad = False
 
-        # 2. Unfreeze Fusion Layers
+        # 2. Unfreeze Fusion Layers (freq branch)
         if self.crosstransformer and hasattr(self.crosstransformer, "fusion_layers"):
-            print("Unfreezing Fusion Layers...")
+            print("Unfreezing Freq Branch Fusion Layers...")
             for param in self.crosstransformer.fusion_layers.parameters():
                 param.requires_grad = True
 
-        # 3. Unfreeze Latent Preprocessor
+        # 3. Unfreeze Fusion Layers (time branch)
+        if self.crosstransformer and hasattr(self.crosstransformer, "fusion_layers_t"):
+            print("Unfreezing Time Branch Fusion Layers...")
+            for param in self.crosstransformer.fusion_layers_t.parameters():
+                param.requires_grad = True
+
+        # 4. Unfreeze Latent Preprocessor
         if hasattr(self, "latent_preprocessor"):
             print("Unfreezing Latent Preprocessor...")
             for param in self.latent_preprocessor.parameters():
