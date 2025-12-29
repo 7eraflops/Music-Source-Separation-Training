@@ -1,15 +1,18 @@
-import math
 from fractions import Fraction
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from demucs.transformer import (
+    CrossTransformerEncoder,
+    MyTransformerEncoderLayer,
+    create_2d_sin_embedding,
+)
 from einops import rearrange
-from torch.utils.checkpoint import checkpoint
 
 # Import the base class and helper components
 from models.demucs4ht import HTDemucs, capture_init
-from demucs.transformer import CrossTransformerEncoder, create_2d_sin_embedding, MyTransformerEncoderLayer
+
 
 class LatentPreprocessor(nn.Module):
     """
@@ -27,15 +30,13 @@ class LatentPreprocessor(nn.Module):
         if "bs_roformer" in latent_sources:
             # BS-Roformer has 384 channels
             self.bs_roformer_proj = nn.Sequential(
-                nn.Conv1d(384, model_channels, 1),
-                nn.GroupNorm(1, model_channels)
+                nn.Conv1d(384, model_channels, 1), nn.GroupNorm(1, model_channels)
             )
 
         if "scnet_xl" in latent_sources:
             # SCNet-XL has 256 channels
             self.scnet_proj = nn.Sequential(
-                nn.Conv1d(256, model_channels, 1),
-                nn.GroupNorm(1, model_channels)
+                nn.Conv1d(256, model_channels, 1), nn.GroupNorm(1, model_channels)
             )
 
     def forward(self, latents, batch_size):
@@ -52,8 +53,8 @@ class LatentPreprocessor(nn.Module):
             # (B, T, F, C) -> (B, C, F, T) -> (B, C, F*T)
             bsr = bsr.permute(0, 3, 2, 1)
             bsr = bsr.flatten(2)
-            bsr = self.bs_roformer_proj(bsr) # (B, C, L)
-            bsr = bsr.transpose(1, 2) # (B, L, C)
+            bsr = self.bs_roformer_proj(bsr)  # (B, C, L)
+            bsr = bsr.transpose(1, 2)  # (B, L, C)
 
             if batch_size > 1:
                 bsr = bsr.expand(batch_size, -1, -1)
@@ -69,8 +70,8 @@ class LatentPreprocessor(nn.Module):
 
             # (B, C, F, T) -> (B, C, F*T)
             scn = scn.flatten(2)
-            scn = self.scnet_proj(scn) # (B, C, L)
-            scn = scn.transpose(1, 2) # (B, L, C)
+            scn = self.scnet_proj(scn)  # (B, C, L)
+            scn = scn.transpose(1, 2)  # (B, L, C)
 
             if batch_size > 1:
                 scn = scn.expand(batch_size, -1, -1)
@@ -86,12 +87,21 @@ class LatentPreprocessor(nn.Module):
 
 class LatentCrossAttentionLayer(nn.Module):
     """Cross-attention layer for fusing external latents. Expects (B, L, C)"""
-    def __init__(self, d_model, nhead=8, dim_feedforward=2048, dropout=0.1, activation="gelu", layer_norm_eps=1e-5):
+
+    def __init__(
+        self,
+        d_model,
+        nhead=8,
+        dim_feedforward=2048,
+        dropout=0.1,
+        activation="gelu",
+        layer_norm_eps=1e-5,
+    ):
         super().__init__()
         self.nhead = nhead
         self.d_model = d_model
         self.head_dim = d_model // nhead
-        
+
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -124,17 +134,23 @@ class LatentCrossAttentionLayer(nn.Module):
         attn_mask = None
         if key_padding_mask is not None:
             # key_padding_mask is (B, L_kv) where True is valid?
-            # Usually mask logic is complex. 
+            # Usually mask logic is complex.
             # If we assume no mask needed for concat (since all are valid parts of song), we can skip.
             # But if passed:
             sdpa_mask = ~key_padding_mask
-            sdpa_mask = sdpa_mask.unsqueeze(1).unsqueeze(1) 
+            sdpa_mask = sdpa_mask.unsqueeze(1).unsqueeze(1)
             attn_mask = sdpa_mask
 
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout_p if self.training else 0.0)
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout_p if self.training else 0.0,
+        )
         x = x.transpose(1, 2).contiguous().view(B, L_q, self.d_model)
         x = self.out_proj(x)
-        
+
         q_out = query + self.dropout1(x)
         x2 = self.norm2(q_out)
         x2 = self.linear2(self.dropout(self.activation(self.linear1(x2))))
@@ -147,20 +163,24 @@ class InterleavedFusionTransformer(CrossTransformerEncoder):
     Inherits from Demucs CrossTransformerEncoder but injects fusion layers
     interleaved after each original cross-attention layer.
     """
-    def __init__(self, *args, num_latent_blocks=2, **kwargs):
+
+    def __init__(self, *args, num_latent_blocks=2, fusion_branch="freq", **kwargs):
         # Initialize original layers
         super().__init__(*args, **kwargs)
-        
+
+        # Store fusion branch setting
+        self.fusion_branch = fusion_branch  # "freq", "time", or "both"
+
         # Initialize fusion layers
         # We need one set of fusion blocks for every Original Cross-Attention Layer.
         # Original Cross-Attn layers occur when idx % 2 != self.classic_parity
-        
-        dim = kwargs.get('dim', args[0] if args else 512)
-        hidden_scale = kwargs.get('hidden_scale', 4.0)
-        nhead = kwargs.get('num_heads', 8)
-        dropout = kwargs.get('dropout', 0.0)
-        gelu = kwargs.get('gelu', True)
-        
+
+        dim = kwargs.get("dim", args[0] if args else 512)
+        hidden_scale = kwargs.get("hidden_scale", 4.0)
+        nhead = kwargs.get("num_heads", 8)
+        dropout = kwargs.get("dropout", 0.0)
+        gelu = kwargs.get("gelu", True)
+
         # Arguments for MyTransformerEncoderLayer to match original
         activation = F.gelu if gelu else F.relu
         kwargs_common = {
@@ -169,47 +189,86 @@ class InterleavedFusionTransformer(CrossTransformerEncoder):
             "dim_feedforward": int(dim * hidden_scale),
             "dropout": dropout,
             "activation": activation,
-            "group_norm": kwargs.get('group_norm', False),
-            "norm_first": kwargs.get('norm_first', True),
-            "norm_out": kwargs.get('norm_out', True),
-            "layer_scale": kwargs.get('layer_scale', True),
-            "mask_type": kwargs.get('mask_type', "diag"),
-            "mask_random_seed": kwargs.get('mask_random_seed', 42),
-            "sparse_attn_window": kwargs.get('sparse_attn_window', 500),
-            "global_window": kwargs.get('global_window', 100),
-            "sparsity": kwargs.get('sparsity', 0.95),
-            "auto_sparsity": kwargs.get('auto_sparsity', False),
+            "group_norm": kwargs.get("group_norm", False),
+            "norm_first": kwargs.get("norm_first", True),
+            "norm_out": kwargs.get("norm_out", True),
+            "layer_scale": kwargs.get("layer_scale", True),
+            "mask_type": kwargs.get("mask_type", "diag"),
+            "mask_random_seed": kwargs.get("mask_random_seed", 42),
+            "sparse_attn_window": kwargs.get("sparse_attn_window", 500),
+            "global_window": kwargs.get("global_window", 100),
+            "sparsity": kwargs.get("sparsity", 0.95),
+            "auto_sparsity": kwargs.get("auto_sparsity", False),
             "batch_first": True,
         }
         kwargs_classic_encoder = dict(kwargs_common)
-        kwargs_classic_encoder.update({
-            "sparse": kwargs.get('sparse_self_attn', False),
-        })
-        
+        kwargs_classic_encoder.update(
+            {
+                "sparse": kwargs.get("sparse_self_attn", False),
+            }
+        )
+
         self.fusion_layers = nn.ModuleList()
+        self.fusion_layers_t = nn.ModuleList()
         dim_feedforward = int(dim * hidden_scale)
         activation_str = "gelu" if gelu else "relu"
-        
+
         for idx in range(self.num_layers):
             if idx % 2 != self.classic_parity:
                 # This is a cross-attention layer location
-                block_units = nn.ModuleList()
-                for _ in range(num_latent_blocks):
-                     block_units.append(nn.ModuleList([
-                         # Use original Demucs Self-Attention Layer
-                         MyTransformerEncoderLayer(**kwargs_classic_encoder),
-                         # Use custom Cross-Attention Layer for Latents
-                         LatentCrossAttentionLayer(
-                             dim, nhead=nhead, dim_feedforward=dim_feedforward, 
-                             dropout=dropout, activation=activation_str
-                         )
-                     ]))
-                self.fusion_layers.append(block_units)
+
+                # Create fusion layers for freq branch if needed
+                if self.fusion_branch in ["freq", "both"]:
+                    block_units = nn.ModuleList()
+                    for _ in range(num_latent_blocks):
+                        block_units.append(
+                            nn.ModuleList(
+                                [
+                                    # Use original Demucs Self-Attention Layer
+                                    MyTransformerEncoderLayer(**kwargs_classic_encoder),
+                                    # Use custom Cross-Attention Layer for Latents
+                                    LatentCrossAttentionLayer(
+                                        dim,
+                                        nhead=nhead,
+                                        dim_feedforward=dim_feedforward,
+                                        dropout=dropout,
+                                        activation=activation_str,
+                                    ),
+                                ]
+                            )
+                        )
+                    self.fusion_layers.append(block_units)
+                else:
+                    self.fusion_layers.append(None)
+
+                # Create fusion layers for time branch if needed
+                if self.fusion_branch in ["time", "both"]:
+                    block_units_t = nn.ModuleList()
+                    for _ in range(num_latent_blocks):
+                        block_units_t.append(
+                            nn.ModuleList(
+                                [
+                                    # Use original Demucs Self-Attention Layer
+                                    MyTransformerEncoderLayer(**kwargs_classic_encoder),
+                                    # Use custom Cross-Attention Layer for Latents
+                                    LatentCrossAttentionLayer(
+                                        dim,
+                                        nhead=nhead,
+                                        dim_feedforward=dim_feedforward,
+                                        dropout=dropout,
+                                        activation=activation_str,
+                                    ),
+                                ]
+                            )
+                        )
+                    self.fusion_layers_t.append(block_units_t)
+                else:
+                    self.fusion_layers_t.append(None)
 
     def forward(self, x, xt, external_latents=None, latent_mask=None):
         # --- Logic copied from CrossTransformerEncoder.forward ---
         # We cannot call super().forward because we need to inject code in the middle of the loop.
-        
+
         B, C, Fr, T1 = x.shape
         pos_emb_2d = create_2d_sin_embedding(
             C, Fr, T1, x.device, self.max_period
@@ -235,15 +294,32 @@ class InterleavedFusionTransformer(CrossTransformerEncoder):
                 old_x = x
                 x = self.layers[idx](x, xt)
                 xt = self.layers_t[idx](xt, old_x)
-                
+
                 # --- INJECT FUSION BLOCKS ---
                 if external_latents is not None:
-                     units = self.fusion_layers[cross_layer_idx]
-                     # x is (B, L, C)
-                     for fusion_self, fusion_cross in units:
-                         x = fusion_self(x)
-                         x = fusion_cross(x, external_latents, key_padding_mask=latent_mask)
-                     cross_layer_idx += 1
+                    # Apply fusion to freq branch if configured
+                    if self.fusion_branch in ["freq", "both"]:
+                        units = self.fusion_layers[cross_layer_idx]
+                        if units is not None:
+                            # x is (B, L, C)
+                            for fusion_self, fusion_cross in units:
+                                x = fusion_self(x)
+                                x = fusion_cross(
+                                    x, external_latents, key_padding_mask=latent_mask
+                                )
+
+                    # Apply fusion to time branch if configured
+                    if self.fusion_branch in ["time", "both"]:
+                        units_t = self.fusion_layers_t[cross_layer_idx]
+                        if units_t is not None:
+                            # xt is (B, L, C)
+                            for fusion_self_t, fusion_cross_t in units_t:
+                                xt = fusion_self_t(xt)
+                                xt = fusion_cross_t(
+                                    xt, external_latents, key_padding_mask=latent_mask
+                                )
+
+                    cross_layer_idx += 1
                 # ----------------------------
 
         x = rearrange(x, "b (t1 fr) c -> b c fr t1", t1=T1)
@@ -267,6 +343,7 @@ class InternalFusionHTDemucs(HTDemucs):
         freeze_encoder=False,
         latent_sources=["bs_roformer", "scnet_xl"],
         num_latent_blocks=2,
+        fusion_branch="freq",
         use_gradient_checkpointing=False,
         normalize=True,
         freeze_base_model=False,
@@ -279,6 +356,7 @@ class InternalFusionHTDemucs(HTDemucs):
             freeze_encoder: Freeze encoder parameters (only train transformer/decoder)
             latent_sources: List of external latent sources to fuse
             num_latent_blocks: Number of latent fusion blocks to add
+            fusion_branch: Which branch to apply fusion to: "freq", "time", or "both"
             normalize: Whether to apply normalization internally (default True for HTDemucs)
             freeze_base_model: If True, freezes all parameters except the new fusion layers
             **kwargs: Arguments passed to HTDemucs
@@ -288,59 +366,62 @@ class InternalFusionHTDemucs(HTDemucs):
 
         self.use_internal_fusion = use_internal_fusion
         self.latent_sources = latent_sources
+        self.fusion_branch = fusion_branch
         self.use_gradient_checkpointing = use_gradient_checkpointing
-        # self.normalize is not used because we use unconditional normalization in forward 
+        # self.normalize is not used because we use unconditional normalization in forward
         # (copied from HTDemucs)
 
         # Replace the standard transformer with our Interleaved Fusion Transformer
         if self.crosstransformer:
             # Re-calculate transformer dimension as CrossTransformerEncoder doesn't expose it
-            channels = kwargs.get('channels', 48)
-            growth = kwargs.get('growth', 2)
-            depth = kwargs.get('depth', 4)
-            bottom_channels = kwargs.get('bottom_channels', 0)
-            
+            channels = kwargs.get("channels", 48)
+            growth = kwargs.get("growth", 2)
+            depth = kwargs.get("depth", 4)
+            bottom_channels = kwargs.get("bottom_channels", 0)
+
             transformer_channels = channels * growth ** (depth - 1)
             if bottom_channels > 0:
                 transformer_channels = bottom_channels
-            
+
             # We reconstruct the transformer using the exact same arguments
             # passed to HTDemucs, but utilizing our Interleaved class.
             self.crosstransformer = InterleavedFusionTransformer(
                 dim=transformer_channels,
-                emb=kwargs.get('t_emb', "sin"),
-                hidden_scale=kwargs.get('t_hidden_scale', 4.0),
-                num_heads=kwargs.get('t_heads', 8),
-                num_layers=kwargs.get('t_layers', 5),
-                cross_first=kwargs.get('t_cross_first', False),
-                dropout=kwargs.get('t_dropout', 0.0),
-                max_positions=kwargs.get('t_max_positions', 10000),
-                norm_in=kwargs.get('t_norm_in', True),
-                norm_in_group=kwargs.get('t_norm_in_group', False),
-                group_norm=kwargs.get('t_group_norm', False),
-                norm_first=kwargs.get('t_norm_first', True),
-                norm_out=kwargs.get('t_norm_out', True),
-                max_period=kwargs.get('t_max_period', 10000.0),
-                weight_decay=kwargs.get('t_weight_decay', 0.0),
-                lr=kwargs.get('t_lr', None),
-                layer_scale=kwargs.get('t_layer_scale', True),
-                gelu=kwargs.get('t_gelu', True),
-                sin_random_shift=kwargs.get('t_sin_random_shift', 0),
-                weight_pos_embed=kwargs.get('t_weight_pos_embed', 1.0),
-                cape_mean_normalize=kwargs.get('t_cape_mean_normalize', True),
-                cape_augment=kwargs.get('t_cape_augment', True),
-                cape_glob_loc_scale=kwargs.get('t_cape_glob_loc_scale', [5000.0, 1.0, 1.4]),
-                sparse_self_attn=kwargs.get('t_sparse_self_attn', False),
-                sparse_cross_attn=kwargs.get('t_sparse_cross_attn', False),
-                mask_type=kwargs.get('t_mask_type', "diag"),
-                mask_random_seed=kwargs.get('t_mask_random_seed', 42),
-                sparse_attn_window=kwargs.get('t_sparse_attn_window', 500),
-                global_window=kwargs.get('t_global_window', 100),
-                sparsity=kwargs.get('t_sparsity', 0.95),
-                auto_sparsity=kwargs.get('t_auto_sparsity', False),
-                
+                emb=kwargs.get("t_emb", "sin"),
+                hidden_scale=kwargs.get("t_hidden_scale", 4.0),
+                num_heads=kwargs.get("t_heads", 8),
+                num_layers=kwargs.get("t_layers", 5),
+                cross_first=kwargs.get("t_cross_first", False),
+                dropout=kwargs.get("t_dropout", 0.0),
+                max_positions=kwargs.get("t_max_positions", 10000),
+                norm_in=kwargs.get("t_norm_in", True),
+                norm_in_group=kwargs.get("t_norm_in_group", False),
+                group_norm=kwargs.get("t_group_norm", False),
+                norm_first=kwargs.get("t_norm_first", True),
+                norm_out=kwargs.get("t_norm_out", True),
+                max_period=kwargs.get("t_max_period", 10000.0),
+                weight_decay=kwargs.get("t_weight_decay", 0.0),
+                lr=kwargs.get("t_lr", None),
+                layer_scale=kwargs.get("t_layer_scale", True),
+                gelu=kwargs.get("t_gelu", True),
+                sin_random_shift=kwargs.get("t_sin_random_shift", 0),
+                weight_pos_embed=kwargs.get("t_weight_pos_embed", 1.0),
+                cape_mean_normalize=kwargs.get("t_cape_mean_normalize", True),
+                cape_augment=kwargs.get("t_cape_augment", True),
+                cape_glob_loc_scale=kwargs.get(
+                    "t_cape_glob_loc_scale", [5000.0, 1.0, 1.4]
+                ),
+                sparse_self_attn=kwargs.get("t_sparse_self_attn", False),
+                sparse_cross_attn=kwargs.get("t_sparse_cross_attn", False),
+                mask_type=kwargs.get("t_mask_type", "diag"),
+                mask_random_seed=kwargs.get("t_mask_random_seed", 42),
+                sparse_attn_window=kwargs.get("t_sparse_attn_window", 500),
+                global_window=kwargs.get("t_global_window", 100),
+                sparsity=kwargs.get("t_sparsity", 0.95),
+                auto_sparsity=kwargs.get("t_auto_sparsity", False),
                 # Fusion specific args
                 num_latent_blocks=num_latent_blocks,
+                fusion_branch=fusion_branch,
             )
 
             if use_internal_fusion:
@@ -351,7 +432,7 @@ class InternalFusionHTDemucs(HTDemucs):
 
         if freeze_encoder:
             self.freeze_encoder_parameters()
-        
+
         if freeze_base_model:
             self.freeze_base_parameters()
 
@@ -360,26 +441,28 @@ class InternalFusionHTDemucs(HTDemucs):
         Freeze all parameters EXCEPT the new fusion layers and preprocessor.
         """
         print("Freezing BASE model parameters (training fusion layers only)...")
-        
+
         # 1. Freeze EVERYTHING first
         for param in self.parameters():
             param.requires_grad = False
-            
+
         # 2. Unfreeze Fusion Layers
-        if self.crosstransformer and hasattr(self.crosstransformer, 'fusion_layers'):
+        if self.crosstransformer and hasattr(self.crosstransformer, "fusion_layers"):
             print("Unfreezing Fusion Layers...")
             for param in self.crosstransformer.fusion_layers.parameters():
                 param.requires_grad = True
-                
+
         # 3. Unfreeze Latent Preprocessor
-        if hasattr(self, 'latent_preprocessor'):
+        if hasattr(self, "latent_preprocessor"):
             print("Unfreezing Latent Preprocessor...")
             for param in self.latent_preprocessor.parameters():
                 param.requires_grad = True
-                
+
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.parameters())
-        print(f"Trainable Parameters: {trainable:,} / {total:,} ({trainable/total:.1%})")
+        print(
+            f"Trainable Parameters: {trainable:,} / {total:,} ({trainable / total:.1%})"
+        )
 
     def freeze_encoder_parameters(self):
         print("Freezing encoder parameters...")
@@ -390,8 +473,9 @@ class InternalFusionHTDemucs(HTDemucs):
         if self.freq_emb is not None:
             for param in self.freq_emb.parameters():
                 param.requires_grad = False
-        frozen_params = sum(p.numel() for p in self.encoder.parameters()) + \
-                        sum(p.numel() for p in self.tencoder.parameters())
+        frozen_params = sum(p.numel() for p in self.encoder.parameters()) + sum(
+            p.numel() for p in self.tencoder.parameters()
+        )
         if self.freq_emb is not None:
             frozen_params += sum(p.numel() for p in self.freq_emb.parameters())
         print(f"Frozen {frozen_params:,} encoder parameters")
@@ -543,6 +627,7 @@ class InternalFusionHTDemucs(HTDemucs):
             x = x[..., :length_pre_pad]
 
         return x
+
 
 def get_model(args):
     """
