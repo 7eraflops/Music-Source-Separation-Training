@@ -45,6 +45,7 @@ htdemucs_internal_fusion:
   freeze_encoder: false # set to true to only train transformer + decoder
   latent_sources: ["bs_roformer", "scnet_xl"] # which external latents to use
   num_latent_blocks: 2 # number of latent fusion blocks to insert
+  fusion_branch: "freq" # which branch to fuse: "freq", "time", or "both"
 
   # --- Standard HTDemucs Parameters ---
   # Channels
